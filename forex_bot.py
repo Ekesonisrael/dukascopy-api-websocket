@@ -16,8 +16,15 @@ MT5_PASSWORD = os.getenv("MT5_PASSWORD")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# Exact Exness Symbol Names (No "m", no slashes)
-SYMBOLS = ["XAUUSD", "EURUSD", "GBPUSD", "USDJPY"]
+# We include both standard and "m" (micro/standard) versions. 
+# The bot will try one, and if it fails, it will try the other.
+SYMBOLS = [
+    "XAUUSD", "XAUUSDm",     # Gold
+    "EURUSD", "EURUSDm",     # Euro
+    "BTCUSD", "BTCUSDm",     # Bitcoin
+    "ETHUSD", "ETHUSDm"      # Ethereum
+]
+
 RISK_PERCENTAGE = 0.03
 JOURNAL_FILE = "forex_journal.json"
 
@@ -60,6 +67,7 @@ def run_strategy():
     journal = load_journal()
 
     for symbol in SYMBOLS:
+        # Skip if we already have an open trade for this specific symbol
         if any(t['symbol'] == symbol and t['status'] == "OPEN" for t in journal):
             continue
 
@@ -68,7 +76,6 @@ def run_strategy():
         df_4h = pd.DataFrame()
         df_15m = pd.DataFrame()
         
-        # Retry Logic
         for attempt in range(2):
             try:
                 candles_4h = client.candles.get(account_id, symbol=symbol, count=50, timeframe="H4")
@@ -78,12 +85,12 @@ def run_strategy():
                 df_15m = pd.DataFrame([{'open': c.open, 'high': c.high, 'low': c.low, 'close': c.close} for c in candles_15m])
                 break 
             except Exception as e:
-                print(f"  Attempt {attempt+1} failed for {symbol}: {e}")
-                time.sleep(2) 
+                # Silently fail and try the next symbol if this name doesn't exist
+                if attempt == 0:
+                    time.sleep(1) 
 
         if df_4h.empty or df_15m.empty or len(df_4h) < 30:
-            print(f"  [SKIP] {symbol}: No data returned (Market might be closed).")
-            continue
+            continue # Skip this symbol (likely a timeout on a wrong name or market closed)
 
         # Calculate Trend & Sweep
         df_4h['ema20'] = df_4h['close'].ewm(span=20, adjust=False).mean()
@@ -112,7 +119,7 @@ def run_strategy():
             print(f"  [HOLD] {symbol}: No sweep setup.")
             continue
 
-        # Execute
+        # Execute Trade
         print(f"🚨 SIGNAL: {signal} {symbol} | Entry: {current_price} | SL: {sl} | TP: {tp}")
         
         try:
