@@ -1,11 +1,12 @@
 import os
 import pandas as pd
 import json
+import time
 from datetime import datetime
 from tickerall import Tickerall
 
 # ==========================================
-# CONFIGURATION (XAU & USD ONLY)
+# CONFIGURATION
 # ==========================================
 TICKERALL_API_KEY = os.getenv("TICKERALL_API_KEY")
 MT5_SERVER = os.getenv("MT5_SERVER")
@@ -15,7 +16,7 @@ MT5_PASSWORD = os.getenv("MT5_PASSWORD")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# Focusing on Gold and major USD pairs
+# Exact Exness Symbol Names (No "m", no slashes)
 SYMBOLS = ["XAUUSD", "EURUSD", "GBPUSD", "USDJPY"]
 RISK_PERCENTAGE = 0.03
 JOURNAL_FILE = "forex_journal.json"
@@ -40,11 +41,9 @@ def save_journal(journal):
 def run_strategy():
     print(f"--- Starting Session at {datetime.now()} ---")
     
-    # 1. Initialize TickerAll Client
-    client = Tickerall(api_key=TICKERALL_API_KEY)
+    client = Tickerall(api_key=TICKERALL_API_KEY, timeout=60)
     
     try:
-        # 2. Start Session
         session = client.sessions.start(
             broker="mt5",
             server=MT5_SERVER,
@@ -53,50 +52,46 @@ def run_strategy():
             terminal_type="MOBILE"
         )
         account_id = session.account_id
-        print(f"Connected successfully! TickerAll Account ID: {account_id}")
+        print(f"Connected successfully! ID: {account_id}")
     except Exception as e:
-        print(f"Failed to connect to MT5: {e}")
-        send_telegram(f"⚠️ MT5 Connection Failed: {e}")
+        print(f"Failed to connect: {e}")
         return
 
     journal = load_journal()
 
     for symbol in SYMBOLS:
-        # Guard: Skip if already in a trade
         if any(t['symbol'] == symbol and t['status'] == "OPEN" for t in journal):
-            print(f"[GUARD] Open trade exists for {symbol}. Skipping.")
             continue
 
-        # 3. Fetch Data (The FIX is here)
-        try:
-            # The SDK returns a list of candle objects directly, no need for ['candles']
-            candles_4h = client.candles.get(account_id, symbol=symbol, count=50, timeframe="H4")
-            candles_15m = client.candles.get(account_id, symbol=symbol, count=50, timeframe="M15")
-            
-            # Convert list of objects to DataFrame
-            df_4h = pd.DataFrame([{
-                'open': c.open, 'high': c.high, 'low': c.low, 'close': c.close
-            } for c in candles_4h])
-            
-            df_15m = pd.DataFrame([{
-                'open': c.open, 'high': c.high, 'low': c.low, 'close': c.close
-            } for c in candles_15m])
-            
-        except Exception as e:
-            print(f"Data error {symbol}: {e}")
-            continue
+        print(f"Fetching data for {symbol}...")
+        
+        df_4h = pd.DataFrame()
+        df_15m = pd.DataFrame()
+        
+        # Retry Logic
+        for attempt in range(2):
+            try:
+                candles_4h = client.candles.get(account_id, symbol=symbol, count=50, timeframe="H4")
+                candles_15m = client.candles.get(account_id, symbol=symbol, count=50, timeframe="M15")
+                
+                df_4h = pd.DataFrame([{'open': c.open, 'high': c.high, 'low': c.low, 'close': c.close} for c in candles_4h])
+                df_15m = pd.DataFrame([{'open': c.open, 'high': c.high, 'low': c.low, 'close': c.close} for c in candles_15m])
+                break 
+            except Exception as e:
+                print(f"  Attempt {attempt+1} failed for {symbol}: {e}")
+                time.sleep(2) 
 
         if df_4h.empty or df_15m.empty or len(df_4h) < 30:
+            print(f"  [SKIP] {symbol}: No data returned (Market might be closed).")
             continue
 
-        # 4. 4H Macro Trend
+        # Calculate Trend & Sweep
         df_4h['ema20'] = df_4h['close'].ewm(span=20, adjust=False).mean()
         df_4h['ema50'] = df_4h['close'].ewm(span=50, adjust=False).mean()
         
         is_bullish = df_4h['ema20'].iloc[-1] > df_4h['ema50'].iloc[-1]
         is_bearish = df_4h['ema20'].iloc[-1] < df_4h['ema50'].iloc[-1]
 
-        # 5. 15m Liquidity Sweep
         current_price = float(df_15m['close'].iloc[-1])
         recent_low = float(df_15m['low'].iloc[-20:-1].min())
         recent_high = float(df_15m['high'].iloc[-20:-1].max())
@@ -114,28 +109,23 @@ def run_strategy():
             sl = recent_high * 1.0005
             tp = current_price - (sl - current_price) * 2.5
         else:
-            print(f"[HOLD] {symbol}: No sweep setup.")
+            print(f"  [HOLD] {symbol}: No sweep setup.")
             continue
 
-        # 6. Execute Trade via SDK
+        # Execute
         print(f"🚨 SIGNAL: {signal} {symbol} | Entry: {current_price} | SL: {sl} | TP: {tp}")
         
         try:
             order = client.orders.place(
-                account_id,
-                type="market",
-                symbol=symbol,
-                side="BUY" if signal == "LONG" else "SELL",
-                volume=0.01,
-                stop_loss=sl,
-                take_profit=tp
+                account_id, type="market", symbol=symbol, side="BUY" if signal == "LONG" else "SELL",
+                volume=0.01, stop_loss=sl, take_profit=tp
             )
             
             journal.append({
                 "symbol": symbol, "side": signal, "entry": current_price,
                 "sl": sl, "tp": tp, "status": "OPEN", "time": datetime.now().isoformat()
             })
-            send_telegram(f"✅ {signal} {symbol}\nEntry: {current_price:.5f}\nSL: {sl:.5f}\nTP: {tp:.5f}\nTicket: {order.ticket}")
+            send_telegram(f"✅ {signal} {symbol}\nEntry: {current_price:.5f}\nSL: {sl:.5f}\nTP: {tp:.5f}")
             
         except Exception as e:
             print(f"Order Failed: {e}")
