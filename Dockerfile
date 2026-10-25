@@ -1,4 +1,4 @@
-FROM openjdk:17-jdk-alpine
+FROM eclipse-temurin:17-jdk-alpine
 EXPOSE 7080
 EXPOSE 7081
 ARG JAR_FILE=target/dukascopy-api-websocket-1.0.war
