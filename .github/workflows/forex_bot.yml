@@ -1,8 +1,9 @@
 name: Forex Gold Bot
+
 on:
-  schedule:
-    - cron: '*/15 * * * *'
-  workflow_dispatch:
+  workflow_dispatch: # This allows external tools to trigger it
+  repository_dispatch:
+    types: [trigger-forex-bot]
 
 permissions:
   contents: write
