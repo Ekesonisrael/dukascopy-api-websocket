@@ -44,7 +44,7 @@ def run_strategy():
     client = Tickerall(api_key=TICKERALL_API_KEY)
     
     try:
-        # 2. Start Session (This returns the dynamic accountId)
+        # 2. Start Session
         session = client.sessions.start(
             broker="mt5",
             server=MT5_SERVER,
@@ -67,15 +67,26 @@ def run_strategy():
             print(f"[GUARD] Open trade exists for {symbol}. Skipping.")
             continue
 
-        # 3. Fetch Data via SDK
+        # 3. Fetch Data (The FIX is here)
         try:
-            df_4h = pd.DataFrame(client.candles.get(account_id, symbol=symbol, timeframe="H4", hours=50)['candles'])
-            df_15m = pd.DataFrame(client.candles.get(account_id, symbol=symbol, timeframe="M15", hours=50)['candles'])
+            # The SDK returns a list of candle objects directly, no need for ['candles']
+            candles_4h = client.candles.get(account_id, symbol=symbol, count=50, timeframe="H4")
+            candles_15m = client.candles.get(account_id, symbol=symbol, count=50, timeframe="M15")
+            
+            # Convert list of objects to DataFrame
+            df_4h = pd.DataFrame([{
+                'open': c.open, 'high': c.high, 'low': c.low, 'close': c.close
+            } for c in candles_4h])
+            
+            df_15m = pd.DataFrame([{
+                'open': c.open, 'high': c.high, 'low': c.low, 'close': c.close
+            } for c in candles_15m])
+            
         except Exception as e:
             print(f"Data error {symbol}: {e}")
             continue
 
-        if len(df_4h) < 30 or len(df_15m) < 30:
+        if df_4h.empty or df_15m.empty or len(df_4h) < 30:
             continue
 
         # 4. 4H Macro Trend
@@ -112,10 +123,10 @@ def run_strategy():
         try:
             order = client.orders.place(
                 account_id,
+                type="market",
                 symbol=symbol,
                 side="BUY" if signal == "LONG" else "SELL",
-                type="market",
-                volume=0.01, # Fixed micro lot for demo safety
+                volume=0.01,
                 stop_loss=sl,
                 take_profit=tp
             )
@@ -124,7 +135,7 @@ def run_strategy():
                 "symbol": symbol, "side": signal, "entry": current_price,
                 "sl": sl, "tp": tp, "status": "OPEN", "time": datetime.now().isoformat()
             })
-            send_telegram(f"✅ {signal} {symbol}\nEntry: {current_price:.5f}\nSL: {sl:.5f}\nTP: {tp:.5f}\nTicket: {order.get('ticket')}")
+            send_telegram(f"✅ {signal} {symbol}\nEntry: {current_price:.5f}\nSL: {sl:.5f}\nTP: {tp:.5f}\nTicket: {order.ticket}")
             
         except Exception as e:
             print(f"Order Failed: {e}")
