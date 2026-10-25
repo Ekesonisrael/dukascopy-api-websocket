@@ -6,7 +6,7 @@ from datetime import datetime
 from tickerall import Tickerall
 
 # ==========================================
-# CONFIGURATION
+# CONFIGURATION (FOREX & GOLD ONLY)
 # ==========================================
 TICKERALL_API_KEY = os.getenv("TICKERALL_API_KEY")
 MT5_SERVER = os.getenv("MT5_SERVER")
@@ -16,13 +16,11 @@ MT5_PASSWORD = os.getenv("MT5_PASSWORD")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# We include both standard and "m" (micro/standard) versions. 
-# The bot will try one, and if it fails, it will try the other.
+# Removed BTC and ETH. Keeping Gold and Major Forex.
 SYMBOLS = [
-    "XAUUSD", "XAUUSDm",     # Gold
-    "EURUSD", "EURUSDm",     # Euro
-    "BTCUSD", "BTCUSDm",     # Bitcoin
-    "ETHUSD", "ETHUSDm"      # Ethereum
+    "XAUUSD", "XAUUSDm",     
+    "EURUSD", "EURUSDm",     
+    
 ]
 
 RISK_PERCENTAGE = 0.03
@@ -85,7 +83,7 @@ def run_strategy():
                 df_15m = pd.DataFrame([{'open': c.open, 'high': c.high, 'low': c.low, 'close': c.close} for c in candles_15m])
                 break 
             except Exception as e:
-                # Silently fail and try the next symbol if this name doesn't exist
+                # Silently fail and try the next symbol if this name doesn't exist (e.g., missing 'm')
                 if attempt == 0:
                     time.sleep(1) 
 
