@@ -58,10 +58,11 @@ def save_journal(journal):
 def check_closed_trades(client, account_id, journal):
     updated = False
     try:
-        open_positions = client.positions.get(account_id)
+        # ✅ FIX: Use the correct TickerAll accounts snapshot method
+        detail = client.accounts.get(account_id)
+        open_positions = detail.positions if hasattr(detail, 'positions') else []
         open_symbols = [p.symbol for p in open_positions]
         
-        # ✅ FIX 1: Use Unix Timestamps (milliseconds) for TickerAll
         from_date = int((datetime.now(timezone.utc) - timedelta(days=3)).timestamp() * 1000)
         to_date = int((datetime.now(timezone.utc) + timedelta(days=1)).timestamp() * 1000)
         
@@ -71,12 +72,9 @@ def check_closed_trades(client, account_id, journal):
             if trade['status'] == "OPEN":
                 if trade['symbol'] not in open_symbols:
                     exit_deal = None
-                    
-                    # Check if history is a list or has a 'deals' attribute
                     deals = history if isinstance(history, list) else getattr(history, 'deals', [])
                     
                     for deal in deals:
-                        # Check for entry type 1 (OUT) or 'OUT' string
                         entry_type = getattr(deal, 'entry', '')
                         if deal.symbol == trade['symbol'] and entry_type in [1, 'OUT', 'out']: 
                             exit_deal = deal
@@ -107,13 +105,11 @@ def check_closed_trades(client, account_id, journal):
                         send_telegram(report)
                         print(report)
                     else:
-                        # ✅ FIX 2: Fail-safe if history API fails or is delayed
                         send_telegram(f"🔔 {trade['symbol']} trade closed. Check Exness app for PnL.")
                     
                     trade['status'] = "CLOSED"
                     updated = True
     except Exception as e:
-        # ✅ FIX 3: Alert you if the resolver crashes
         print(f"Error resolving history: {e}")
         send_telegram(f"⚠️ Resolver Error: Could not fetch history. Error: {e}")
         
@@ -142,7 +138,7 @@ def run_strategy():
 
     # 1. FIRST: Run the Autopsy on old trades
     if check_closed_trades(client, account_id, journal):
-        save_journal(journal) # Save the new CLOSED statuses immediately
+        save_journal(journal)
 
     # 2. SECOND: Hunt for new trades
     for symbol in SYMBOLS:
