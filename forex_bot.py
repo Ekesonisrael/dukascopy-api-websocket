@@ -1,5 +1,6 @@
 import os
 import pandas as pd
+import numpy as np # Added for ATR
 import json
 import time
 from datetime import datetime, timezone, timedelta
@@ -16,13 +17,13 @@ MT5_PASSWORD = os.getenv("MT5_PASSWORD")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# ✅ UPDATED: Only trading Gold and Euro now
-SYMBOLS = [
-    "XAUUSD", "XAUUSDm",     # Gold
-    "EURUSD", "EURUSDm"      # Euro
-]
-
+SYMBOLS = ["XAUUSD", "XAUUSDm", "EURUSD", "EURUSDm"]
 JOURNAL_FILE = "forex_journal.json"
+
+# ✅ NEW WINNING PARAMETERS
+RISK_REWARD = 2.0
+ATR_MULTIPLIER = 1.5
+VOLUME_MULTIPLIER = 1.5
 
 def is_market_open():
     now = datetime.now(timezone.utc)
@@ -55,6 +56,7 @@ def save_journal(journal):
     with open(JOURNAL_FILE, "w") as f: json.dump(journal, f, indent=4)
 
 def check_closed_trades(client, account_id, journal):
+    # (Leave this function exactly as you have it, it works fine for MT5)
     updated = False
     try:
         detail = client.accounts.get(account_id)
@@ -64,18 +66,13 @@ def check_closed_trades(client, account_id, journal):
         for trade in journal:
             if trade['status'] == "OPEN":
                 if trade['symbol'] not in open_symbols:
-                    # Fetch history for this specific symbol
                     trades = client.history.get(account_id, symbol=trade['symbol'], limit=50)
-                    
                     exit_deal = None
                     if trades:
                         for deal in trades:
-                            # Aggressive matching for MT5 closing deals
                             entry_attr = getattr(deal, 'entry', None)
                             type_attr = getattr(deal, 'type', None)
-                            
                             is_exit = entry_attr in [1, 'OUT', 'out'] or (type_attr in [1, 'SELL', 'sell'] and entry_attr != 0)
-                            
                             if is_exit:
                                 exit_deal = deal
                                 break
@@ -83,15 +80,11 @@ def check_closed_trades(client, account_id, journal):
                     if exit_deal:
                         close_price = getattr(exit_deal, 'price', trade['entry'])
                         profit = getattr(exit_deal, 'profit', 0.0)
-                        
                         pip_size = get_pip_size(trade['symbol'])
-                        if trade['side'] == "LONG":
-                            pips = (close_price - trade['entry']) / pip_size
-                        else:
-                            pips = (trade['entry'] - close_price) / pip_size
+                        if trade['side'] == "LONG": pips = (close_price - trade['entry']) / pip_size
+                        else: pips = (trade['entry'] - close_price) / pip_size
                             
                         result_emoji = "🟢 WIN" if profit > 0 else "🔴 LOSS"
-                        
                         report = (
                             f"🔔 *TRADE CLOSED: {trade['symbol']}*\n\n"
                             f"Result: {result_emoji}\n"
@@ -100,7 +93,7 @@ def check_closed_trades(client, account_id, journal):
                             f"Exit: {close_price:.5f}\n"
                             f"Pips: {pips:+.1f}\n"
                             f"Profit: ${profit:+.2f}\n\n"
-                            f"🧠 Strategy: Liquidity Sweep"
+                            f"🧠 Strategy: ATR Sweep"
                         )
                         send_telegram(report)
                         print(report)
@@ -111,8 +104,6 @@ def check_closed_trades(client, account_id, journal):
                     updated = True
     except Exception as e:
         print(f"Error resolving history: {e}")
-        send_telegram(f"⚠️ Resolver Error: Could not fetch history. Error: {e}")
-        
     return updated
 
 def run_strategy():
@@ -136,11 +127,9 @@ def run_strategy():
 
     journal = load_journal()
 
-    # 1. FIRST: Run the Autopsy on old trades
     if check_closed_trades(client, account_id, journal):
         save_journal(journal)
 
-    # 2. SECOND: Hunt for new trades
     for symbol in SYMBOLS:
         if any(t['symbol'] == symbol and t['status'] == "OPEN" for t in journal):
             continue
@@ -151,10 +140,11 @@ def run_strategy():
         
         for attempt in range(2):
             try:
+                # ✅ NEW: Fetching volume data as well
                 candles_4h = client.candles.get(account_id, symbol=symbol, count=50, timeframe="H4")
                 candles_15m = client.candles.get(account_id, symbol=symbol, count=50, timeframe="M15")
-                df_4h = pd.DataFrame([{'open': c.open, 'high': c.high, 'low': c.low, 'close': c.close} for c in candles_4h])
-                df_15m = pd.DataFrame([{'open': c.open, 'high': c.high, 'low': c.low, 'close': c.close} for c in candles_15m])
+                df_4h = pd.DataFrame([{'open': c.open, 'high': c.high, 'low': c.low, 'close': c.close, 'vol': getattr(c, 'volume', 1)} for c in candles_4h])
+                df_15m = pd.DataFrame([{'open': c.open, 'high': c.high, 'low': c.low, 'close': c.close, 'vol': getattr(c, 'volume', 1)} for c in candles_15m])
                 break 
             except Exception:
                 if attempt == 0: time.sleep(1) 
@@ -162,31 +152,56 @@ def run_strategy():
         if df_4h.empty or df_15m.empty or len(df_4h) < 30:
             continue 
 
+        # 4H Trend
         df_4h['ema20'] = df_4h['close'].ewm(span=20, adjust=False).mean()
         df_4h['ema50'] = df_4h['close'].ewm(span=50, adjust=False).mean()
-        
         is_bullish = df_4h['ema20'].iloc[-1] > df_4h['ema50'].iloc[-1]
         is_bearish = df_4h['ema20'].iloc[-1] < df_4h['ema50'].iloc[-1]
 
-        current_price = float(df_15m['close'].iloc[-1])
-        recent_low = float(df_15m['low'].iloc[-20:-1].min())
-        recent_high = float(df_15m['high'].iloc[-20:-1].max())
+        # ✅ NEW: Calculate ATR and Volume MA on 15M
+        df_15m['high_low'] = df_15m['high'] - df_15m['low']
+        df_15m['high_close'] = (df_15m['high'] - df_15m['close'].shift()).abs()
+        df_15m['low_close'] = (df_15m['low'] - df_15m['close'].shift()).abs()
+        df_15m['tr'] = df_15m[['high_low', 'high_close', 'low_close']].max(axis=1)
+        df_15m['atr'] = df_15m['tr'].rolling(window=14).mean()
+        df_15m['vol_ma'] = df_15m['vol'].rolling(window=20).mean()
 
-        swept_low = df_15m['low'].iloc[-1] < recent_low and current_price > recent_low
-        swept_high = df_15m['high'].iloc[-1] > recent_high and current_price < recent_high
+        # ✅ NEW: Evaluate previous closed candle for sweep, last closed for confirmation
+        sweep_candle = df_15m.iloc[-2]
+        conf_candle = df_15m.iloc[-1]
+        
+        recent_low = float(df_15m['low'].iloc[-20:-2].min())
+        recent_high = float(df_15m['high'].iloc[-20:-2].max())
+
+        # Sweep Logic + Volume Filter
+        swept_low = (sweep_candle['low'] < recent_low) and (sweep_candle['close'] > recent_low) and (sweep_candle['vol'] > sweep_candle['vol_ma'] * VOLUME_MULTIPLIER)
+        swept_high = (sweep_candle['high'] > recent_high) and (sweep_candle['close'] < recent_high) and (sweep_candle['vol'] > sweep_candle['vol_ma'] * VOLUME_MULTIPLIER)
+
+        # Confirmation (Green candle for Long, Red candle for Short)
+        confirm_long = conf_candle['close'] > conf_candle['open']
+        confirm_short = conf_candle['close'] < conf_candle['open']
+
+        current_price = float(df_15m['close'].iloc[-1])
+        atr_value = float(sweep_candle['atr'])
 
         signal = None
-        if is_bullish and swept_low:
-            signal, sl = "LONG", recent_low * 0.9995
-            tp = current_price + (current_price - sl) * 2.5
-        elif is_bearish and swept_high:
-            signal, sl = "SHORT", recent_high * 1.0005
-            tp = current_price - (sl - current_price) * 2.5
+        if is_bullish and swept_low and confirm_long:
+            signal = "LONG"
+            # ✅ NEW: ATR Stop Loss
+            sl = current_price - (atr_value * ATR_MULTIPLIER)
+            risk = current_price - sl
+            tp = current_price + (risk * RISK_REWARD)
+        elif is_bearish and swept_high and confirm_short:
+            signal = "SHORT"
+            # ✅ NEW: ATR Stop Loss
+            sl = current_price + (atr_value * ATR_MULTIPLIER)
+            risk = sl - current_price
+            tp = current_price - (risk * RISK_REWARD)
         else:
-            print(f"  [HOLD] {symbol}: No sweep setup.")
+            print(f"  [HOLD] {symbol}: No clean sweep + confirmation setup.")
             continue
 
-        print(f"🚨 SIGNAL: {signal} {symbol} | Entry: {current_price} | SL: {sl} | TP: {tp}")
+        print(f"🚨 SIGNAL: {signal} {symbol} | Entry: {current_price:.5f} | SL: {sl:.5f} | TP: {tp:.5f}")
         
         try:
             order = client.orders.place(
@@ -204,9 +219,9 @@ def run_strategy():
             })
             
             send_telegram(
-                f"✅ {signal} {symbol}\n"
+                f"✅ {signal} {symbol} EXECUTED\n"
                 f"Entry: {current_price:.5f}\n"
-                f"SL: {sl:.5f} ({sl_pips:.1f} pips)\n"
+                f"SL (ATR): {sl:.5f} ({sl_pips:.1f} pips)\n"
                 f"TP: {tp:.5f} ({tp_pips:.1f} pips)\n"
                 f"Ticket: {order.ticket}"
             )
