@@ -1,64 +1,96 @@
-import yfinance as yf
+import os
 import pandas as pd
 import numpy as np
+import time
+from datetime import datetime, timezone
+from tickerall import Tickerall
 
 # ==========================================
 # CONFIGURATION
 # ==========================================
-SYMBOLS = {
-    "GC=F": "Gold Futures" # Only testing Gold
-}
+TICKERALL_API_KEY = os.getenv("TICKERALL_API_KEY")
+MT5_SERVER = os.getenv("MT5_SERVER")
+MT5_ACCOUNT = int(os.getenv("MT5_ACCOUNT"))
+MT5_PASSWORD = os.getenv("MT5_PASSWORD")
+
+SYMBOL = "XAUUSD" # Testing Gold
 RISK_REWARD = 2.0
 ATR_MULTIPLIER = 1.5
-FEE_RATE = 0.0001 
+VOLUME_MULTIPLIER = 1.5
+FEE_RATE = 0.0001 # Spread equivalent
 
 TRADING_HOURS_START = 13
 TRADING_HOURS_END = 17
 
-def run_backtest(ticker, name):
-    print(f"\nFetching 60 days of 15m data for {name} ({ticker})...")
+def run_backtest():
+    print(f"Connecting to MT5 to fetch 200 days of data for {SYMBOL}...")
     
-    # Yahoo only allows 15m data for 60 days
-    df = yf.download(ticker, period="60d", interval="15m", progress=False)
-    
-    if df.empty:
-        print(f"Failed to fetch data for {ticker}")
+    client = Tickerall(api_key=TICKERALL_API_KEY, timeout=60)
+    try:
+        session = client.sessions.start(
+            broker="mt5", server=MT5_SERVER, account=MT5_ACCOUNT,
+            password=MT5_PASSWORD, terminal_type="MOBILE"
+        )
+        account_id = session.account_id
+    except Exception as e:
+        print(f"Failed to connect to MT5: {e}")
         return
 
-    if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.droplevel(1)
-    df.reset_index(inplace=True)
-    
-    df['Datetime'] = pd.to_datetime(df['Datetime'])
-    df.set_index('Datetime', inplace=True)
-    
-    df_4h = df.resample('4h').agg({'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last'}).dropna()
-    df_4h['ema20'] = df_4h['Close'].ewm(span=20, adjust=False).mean()
-    df_4h['ema50'] = df_4h['Close'].ewm(span=50, adjust=False).mean()
+    # Fetch candles (15m). 200 days * 24 hours * 4 candles = 19,200 candles
+    # We request 20,000 to be safe
+    try:
+        candles_15m = client.candles.get(account_id, symbol=SYMBOL, count=20000, timeframe="M15")
+    except Exception as e:
+        print(f"Failed to fetch candles: {e}")
+        return
+
+    if not candles_15m:
+        print("No data returned from MT5.")
+        return
+
+    print(f"Successfully fetched {len(candles_15m)} candles. Processing data...")
+
+    # Build DataFrame
+    df = pd.DataFrame([{
+        'time': c.time, 'open': c.open, 'high': c.high, 'low': c.low, 'close': c.close, 'vol': getattr(c, 'volume', 1)
+    } for c in candles_15m])
+
+    df['time'] = pd.to_datetime(df['time'])
+    df.set_index('time', inplace=True)
+
+    # Resample to 4H for the trend
+    df_4h = df.resample('4h').agg({'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last'}).dropna()
+    df_4h['ema20'] = df_4h['close'].ewm(span=20, adjust=False).mean()
+    df_4h['ema50'] = df_4h['close'].ewm(span=50, adjust=False).mean()
     df_4h['trend'] = np.where(df_4h['ema20'] > df_4h['ema50'], 1, -1)
-    
+
     df.reset_index(inplace=True)
-    
-    df['high_low'] = df['High'] - df['Low']
-    df['high_close'] = (df['High'] - df['Close'].shift()).abs()
-    df['low_close'] = (df['Low'] - df['Close'].shift()).abs()
+
+    # Calculate ATR and Vol MA on 15M
+    df['high_low'] = df['high'] - df['low']
+    df['high_close'] = (df['high'] - df['close'].shift()).abs()
+    df['low_close'] = (df['low'] - df['close'].shift()).abs()
     df['tr'] = df[['high_low', 'high_close', 'low_close']].max(axis=1)
     df['atr'] = df['tr'].rolling(window=14).mean()
-    
-    df['recent_low'] = df['Low'].rolling(window=20).min().shift(1)
-    df['recent_high'] = df['High'].rolling(window=20).max().shift(1)
+    df['vol_ma'] = df['vol'].rolling(window=20).mean()
 
-    df['4h_time'] = df['Datetime'].dt.floor('4h')
+    df['recent_low'] = df['low'].rolling(window=20).min().shift(1)
+    df['recent_high'] = df['high'].rolling(window=20).max().shift(1)
+
+    # Merge 4H Trend
+    df['4h_time'] = df['time'].dt.floor('4h')
     df = pd.merge_asof(df, df_4h[['trend']], left_on='4h_time', right_index=True, direction='backward')
 
     trades = []
-    i = 20 
+    i = 50 
 
     while i < len(df) - 2:
         sweep_row = df.iloc[i]
         conf_row = df.iloc[i+1]
         entry_row = df.iloc[i+2]
 
-        current_hour = sweep_row['Datetime'].hour
+        # Session Filter
+        current_hour = sweep_row['time'].hour
         if not (TRADING_HOURS_START <= current_hour < TRADING_HOURS_END):
             i += 1
             continue
@@ -66,14 +98,14 @@ def run_backtest(ticker, name):
         trade_entered = False
         side = None
 
-        swept_low = (sweep_row['Low'] < sweep_row['recent_low']) and (sweep_row['Close'] > sweep_row['recent_low'])
-        swept_high = (sweep_row['High'] > sweep_row['recent_high']) and (sweep_row['Close'] < sweep_row['recent_high'])
+        swept_low = (sweep_row['low'] < sweep_row['recent_low']) and (sweep_row['close'] > sweep_row['recent_low']) and (sweep_row['vol'] > sweep_row['vol_ma'] * VOLUME_MULTIPLIER)
+        swept_high = (sweep_row['high'] > sweep_row['recent_high']) and (sweep_row['close'] < sweep_row['recent_high']) and (sweep_row['vol'] > sweep_row['vol_ma'] * VOLUME_MULTIPLIER)
 
-        conf_long = conf_row['Close'] > conf_row['Open']
-        conf_short = conf_row['Close'] < conf_row['Open']
+        conf_long = conf_row['close'] > conf_row['open']
+        conf_short = conf_row['close'] < conf_row['open']
 
         if sweep_row['trend'] == 1 and swept_low and conf_long:
-            entry = entry_row['Open']
+            entry = entry_row['open']
             sl = entry - (sweep_row['atr'] * ATR_MULTIPLIER)
             risk = entry - sl
             tp = entry + (risk * RISK_REWARD)
@@ -81,7 +113,7 @@ def run_backtest(ticker, name):
             side = 'LONG'
             
         elif sweep_row['trend'] == -1 and swept_high and conf_short:
-            entry = entry_row['Open']
+            entry = entry_row['open']
             sl = entry + (sweep_row['atr'] * ATR_MULTIPLIER)
             risk = sl - entry
             tp = entry - (risk * RISK_REWARD)
@@ -97,18 +129,18 @@ def run_backtest(ticker, name):
                 candle = df.iloc[j]
                 
                 if side == 'LONG':
-                    if candle['Low'] <= sl:
+                    if candle['low'] <= sl:
                         result = 'LOSS'
                         exit_idx = j; break
-                    elif candle['High'] >= tp:
+                    elif candle['high'] >= tp:
                         result = 'WIN'
                         exit_idx = j; break
                         
                 elif side == 'SHORT':
-                    if candle['High'] >= sl:
+                    if candle['high'] >= sl:
                         result = 'LOSS'
                         exit_idx = j; break
-                    elif candle['Low'] <= tp:
+                    elif candle['low'] <= tp:
                         result = 'WIN'
                         exit_idx = j; break
 
@@ -129,10 +161,9 @@ def run_backtest(ticker, name):
     wins = sum(1 for t in trades if t['result'] == 'WIN')
     total_r = sum(t['r'] for t in trades)
 
-    print(f"=== {name} 60-DAY BACKTEST (15m) ===")
+    print(f"=== {SYMBOL} 200-DAY BACKTEST (15m MT5 Data) ===")
     print(f"Total Trades: {total} | Wins: {wins} | Win Rate: {(wins/total)*100:.2f}%")
     print(f"Total R: {total_r:+.2f}R | Avg R: {(total_r/total):+.2f}R")
 
 if __name__ == "__main__":
-    for ticker, name in SYMBOLS.items():
-        run_backtest(ticker, name)
+    run_backtest()
