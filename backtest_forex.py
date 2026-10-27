@@ -6,53 +6,51 @@ import numpy as np
 # CONFIGURATION
 # ==========================================
 SYMBOLS = {
-    "GC=F": "Gold Futures",    # XAUUSD proxy on Yahoo
+    "GC=F": "Gold Futures",    # XAUUSD proxy
     "EURUSD=X": "Euro/USD"
 }
 RISK_REWARD = 2.0
 ATR_MULTIPLIER = 1.5
-VOLUME_MULTIPLIER = 1.5
-FEE_RATE = 0.0001 # Spread equivalent (1 pip)
+FEE_RATE = 0.0001 # Spread equivalent
 
 def run_backtest(ticker, name):
     print(f"\nFetching data for {name} ({ticker})...")
     
-    # Fetch 15m data (yfinance limits 15m data to 60 days)
-    df_15m = yf.download(ticker, period="60d", interval="15m", progress=False)
-    df_4h = yf.download(ticker, period="60d", interval="1h", progress=False) # Use 1H to resample or just use for trend
+    # Fetch 15m data
+    df = yf.download(ticker, period="60d", interval="15m", progress=False)
     
-    if df_15m.empty or df_4h.empty:
+    if df.empty:
         print(f"Failed to fetch data for {ticker}")
         return
 
-    # Flatten multi-index columns if necessary
-    if isinstance(df_15m.columns, pd.MultiIndex): df_15m.columns = df_15m.columns.droplevel(1)
-    if isinstance(df_4h.columns, pd.MultiIndex): df_4h.columns = df_4h.columns.droplevel(1)
-
-    df_15m.reset_index(inplace=True)
-    df_4h.reset_index(inplace=True)
+    # Flatten multi-index columns
+    if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.droplevel(1)
+    df.reset_index(inplace=True)
     
-    # Calculate 4H Trend (Using 1H resampled or just 1H as proxy if 4H missing)
+    # Create 4H Trend data by resampling the 15m data
+    df['Datetime'] = pd.to_datetime(df['Datetime'])
+    df.set_index('Datetime', inplace=True)
+    
+    df_4h = df.resample('4h').agg({'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last'}).dropna()
     df_4h['ema20'] = df_4h['Close'].ewm(span=20, adjust=False).mean()
     df_4h['ema50'] = df_4h['Close'].ewm(span=50, adjust=False).mean()
     df_4h['trend'] = np.where(df_4h['ema20'] > df_4h['ema50'], 1, -1)
-
-    # Calculate ATR and Vol MA on 15M
-    df_15m['high_low'] = df_15m['High'] - df_15m['Low']
-    df_15m['high_close'] = (df_15m['High'] - df_15m['Close'].shift()).abs()
-    df_15m['low_close'] = (df_15m['Low'] - df_15m['Close'].shift()).abs()
-    df_15m['tr'] = df_15m[['high_low', 'high_close', 'low_close']].max(axis=1)
-    df_15m['atr'] = df_15m['tr'].rolling(window=14).mean()
-    df_15m['vol_ma'] = df_15m['Volume'].rolling(window=20).mean()
     
-    df_15m['recent_low'] = df_15m['Low'].rolling(window=20).min().shift(1)
-    df_15m['recent_high'] = df_15m['High'].rolling(window=20).max().shift(1)
+    df.reset_index(inplace=True)
+    
+    # Calculate ATR on 15M
+    df['high_low'] = df['High'] - df['Low']
+    df['high_close'] = (df['High'] - df['Close'].shift()).abs()
+    df['low_close'] = (df['Low'] - df['Close'].shift()).abs()
+    df['tr'] = df[['high_low', 'high_close', 'low_close']].max(axis=1)
+    df['atr'] = df['tr'].rolling(window=14).mean()
+    
+    df['recent_low'] = df['Low'].rolling(window=20).min().shift(1)
+    df['recent_high'] = df['High'].rolling(window=20).max().shift(1)
 
-    # Merge Trend onto 15m data
-    # Ensure datetime columns match types
-    df_15m['Date'] = pd.to_datetime(df_15m['Datetime']).dt.tz_localize(None)
-    df_4h['Date'] = pd.to_datetime(df_4h['Datetime']).dt.tz_localize(None)
-    df = pd.merge_asof(df_15m, df_4h[['Date', 'trend']], on='Date', direction='backward')
+    # Merge Trend onto 15m data using 4H timestamps
+    df['4h_time'] = df['Datetime'].dt.floor('4h')
+    df = pd.merge_asof(df, df_4h[['trend']], left_on='4h_time', right_index=True, direction='backward')
 
     trades = []
     i = 20
@@ -65,9 +63,9 @@ def run_backtest(ticker, name):
         trade_entered = False
         side = None
 
-        # Sweep + Volume Filters
-        swept_low = (sweep_row['Low'] < sweep_row['recent_low']) and (sweep_row['Close'] > sweep_row['recent_low']) and (sweep_row['Volume'] > sweep_row['vol_ma'] * VOLUME_MULTIPLIER)
-        swept_high = (sweep_row['High'] > sweep_row['recent_high']) and (sweep_row['Close'] < sweep_row['recent_high']) and (sweep_row['Volume'] > sweep_row['vol_ma'] * VOLUME_MULTIPLIER)
+        # Sweep Filters (No Volume Filter for Forex)
+        swept_low = (sweep_row['Low'] < sweep_row['recent_low']) and (sweep_row['Close'] > sweep_row['recent_low'])
+        swept_high = (sweep_row['High'] > sweep_row['recent_high']) and (sweep_row['Close'] < sweep_row['recent_high'])
 
         # Confirmation
         conf_long = conf_row['Close'] > conf_row['Open']
@@ -92,39 +90,30 @@ def run_backtest(ticker, name):
         if trade_entered:
             exit_idx = None
             result = None
-            cost_r = FEE_RATE / (risk / entry) # Approx spread cost in R
-            breakeven_triggered = False
+            cost_r = FEE_RATE / (risk / entry) 
 
             for j in range(i+2, len(df)):
                 candle = df.iloc[j]
                 
                 if side == 'LONG':
-                    if not breakeven_triggered and candle['High'] >= entry + risk:
-                        sl = entry + (entry * FEE_RATE) # Move to BE + fees
-                        breakeven_triggered = True
                     if candle['Low'] <= sl:
-                        result = 'WIN' if breakeven_triggered else 'LOSS'
+                        result = 'LOSS'
                         exit_idx = j; break
                     elif candle['High'] >= tp:
-                        result, exit_idx = 'WIN', j; break
+                        result = 'WIN'
+                        exit_idx = j; break
                         
                 elif side == 'SHORT':
-                    if not breakeven_triggered and candle['Low'] <= entry - risk:
-                        sl = entry - (entry * FEE_RATE)
-                        breakeven_triggered = True
                     if candle['High'] >= sl:
-                        result = 'WIN' if breakeven_triggered else 'LOSS'
+                        result = 'LOSS'
                         exit_idx = j; break
                     elif candle['Low'] <= tp:
-                        result, exit_idx = 'WIN', j; break
+                        result = 'WIN'
+                        exit_idx = j; break
 
             if exit_idx:
-                if result == 'WIN':
-                    net_r = RISK_REWARD if not breakeven_triggered else 0.0
-                else:
-                    net_r = -1.0
-                
-                trades.append({'result': result, 'r': net_r - cost_r})
+                net_r = (RISK_REWARD if result == 'WIN' else -1.0) - cost_r
+                trades.append({'result': result, 'r': net_r})
                 i = exit_idx + 1
             else:
                 i += 1
@@ -136,7 +125,7 @@ def run_backtest(ticker, name):
         return
 
     total = len(trades)
-    wins = sum(1 for t in trades if t['r'] > 0)
+    wins = sum(1 for t in trades if t['result'] == 'WIN')
     total_r = sum(t['r'] for t in trades)
 
     print(f"=== {name} BACKTEST RESULTS ===")
