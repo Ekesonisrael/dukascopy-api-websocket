@@ -3,7 +3,7 @@ import pandas as pd
 import numpy as np 
 import json
 import time
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from tickerall import Tickerall
 
 # ==========================================
@@ -18,9 +18,10 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 # ✅ ONLY GOLD
-SYMBOLS = ["XAUUSD", "XAUUSDm"]
+SYMBOLS = ["XAUUSD", "XAUUSDm"] 
 JOURNAL_FILE = "forex_journal.json"
 
+# ✅ THE EXACT LOGIC WE BACKTESTED
 RISK_REWARD = 2.0
 ATR_MULTIPLIER = 1.5
 VOLUME_MULTIPLIER = 1.5
