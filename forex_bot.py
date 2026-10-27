@@ -16,9 +16,10 @@ MT5_PASSWORD = os.getenv("MT5_PASSWORD")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
+# ✅ UPDATED: Only trading Gold and Euro now
 SYMBOLS = [
     "XAUUSD", "XAUUSDm",     # Gold
-    "EURUSD", "EURUSDm",     # Euro
+    "EURUSD", "EURUSDm"      # Euro
 ]
 
 JOURNAL_FILE = "forex_journal.json"
