@@ -1,12 +1,11 @@
-name: Run Forex Backtest
+name: Pro Quant Backtest
 
 on:
-  workflow_dispatch: 
+  workflow_dispatch:
 
 jobs:
-  run-backtest:
+  run-pro-backtest:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v3
@@ -19,12 +18,7 @@ jobs:
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install pandas numpy yfinance
 
-      - name: Run Forex Backtest Script
-        env:
-          TICKERALL_API_KEY: ${{ secrets.TICKERALL_API_KEY }}
-          MT5_SERVER: ${{ secrets.MT5_SERVER }}
-          MT5_ACCOUNT: ${{ secrets.MT5_ACCOUNT }}
-          MT5_PASSWORD: ${{ secrets.MT5_PASSWORD }}
-        run: python pro_backtest.yml
+      - name: Run Pro Backtest
+        run: python pro_backtest.py
