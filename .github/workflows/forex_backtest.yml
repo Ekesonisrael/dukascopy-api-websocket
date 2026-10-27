@@ -27,4 +27,4 @@ jobs:
           MT5_SERVER: ${{ secrets.MT5_SERVER }}
           MT5_ACCOUNT: ${{ secrets.MT5_ACCOUNT }}
           MT5_PASSWORD: ${{ secrets.MT5_PASSWORD }}
-        run: python backtest_forex.py
+        run: python pro_backtest.yml
