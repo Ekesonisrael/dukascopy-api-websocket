@@ -58,7 +58,6 @@ def save_journal(journal):
 def check_closed_trades(client, account_id, journal):
     updated = False
     try:
-        # 1. Get current open positions
         detail = client.accounts.get(account_id)
         open_positions = detail.positions if hasattr(detail, 'positions') else []
         open_symbols = [p.symbol for p in open_positions]
@@ -66,23 +65,27 @@ def check_closed_trades(client, account_id, journal):
         for trade in journal:
             if trade['status'] == "OPEN":
                 if trade['symbol'] not in open_symbols:
-                    # 2. Fetch history using the correct method
-                    trades = client.history.get(account_id, symbol=trade['symbol'], limit=100)
+                    # Fetch history for this specific symbol
+                    trades = client.history.get(account_id, symbol=trade['symbol'], limit=50)
                     
                     exit_deal = None
                     if trades:
-                        # Find the most recent closing deal for this symbol
                         for deal in trades:
-                            entry_type = getattr(deal, 'entry', '')
-                            if entry_type in [1, 'OUT', 'out']: 
+                            # Aggressive matching for MT5 closing deals
+                            entry_attr = getattr(deal, 'entry', None)
+                            type_attr = getattr(deal, 'type', None)
+                            
+                            is_exit = entry_attr in [1, 'OUT', 'out'] or (type_attr in [1, 'SELL', 'sell'] and entry_attr != 0)
+                            
+                            if is_exit:
                                 exit_deal = deal
                                 break
                     
                     if exit_deal:
                         close_price = getattr(exit_deal, 'price', trade['entry'])
                         profit = getattr(exit_deal, 'profit', 0.0)
-                        pip_size = get_pip_size(trade['symbol'])
                         
+                        pip_size = get_pip_size(trade['symbol'])
                         if trade['side'] == "LONG":
                             pips = (close_price - trade['entry']) / pip_size
                         else:
