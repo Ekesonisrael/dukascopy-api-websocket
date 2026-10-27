@@ -19,6 +19,8 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 SYMBOLS = [
     "XAUUSD", "XAUUSDm",     # Gold
     "EURUSD", "EURUSDm",     # Euro
+    "GBPUSD", "GBPUSDm",     # Pound
+    "USDJPY", "USDJPYm"      # Yen
 ]
 
 JOURNAL_FILE = "forex_journal.json"
@@ -56,31 +58,29 @@ def save_journal(journal):
 def check_closed_trades(client, account_id, journal):
     updated = False
     try:
-        # ✅ FIX: Use the correct TickerAll accounts snapshot method
+        # 1. Get current open positions
         detail = client.accounts.get(account_id)
         open_positions = detail.positions if hasattr(detail, 'positions') else []
         open_symbols = [p.symbol for p in open_positions]
         
-        from_date = int((datetime.now(timezone.utc) - timedelta(days=3)).timestamp() * 1000)
-        to_date = int((datetime.now(timezone.utc) + timedelta(days=1)).timestamp() * 1000)
-        
-        history = client.history.deals_get(account_id, from_date=from_date, to_date=to_date)
-        
         for trade in journal:
             if trade['status'] == "OPEN":
                 if trade['symbol'] not in open_symbols:
-                    exit_deal = None
-                    deals = history if isinstance(history, list) else getattr(history, 'deals', [])
+                    # 2. Fetch history using the correct method
+                    trades = client.history.get(account_id, symbol=trade['symbol'], limit=100)
                     
-                    for deal in deals:
-                        entry_type = getattr(deal, 'entry', '')
-                        if deal.symbol == trade['symbol'] and entry_type in [1, 'OUT', 'out']: 
-                            exit_deal = deal
-                            break
+                    exit_deal = None
+                    if trades:
+                        # Find the most recent closing deal for this symbol
+                        for deal in trades:
+                            entry_type = getattr(deal, 'entry', '')
+                            if entry_type in [1, 'OUT', 'out']: 
+                                exit_deal = deal
+                                break
                     
                     if exit_deal:
-                        close_price = exit_deal.price
-                        profit = exit_deal.profit
+                        close_price = getattr(exit_deal, 'price', trade['entry'])
+                        profit = getattr(exit_deal, 'profit', 0.0)
                         pip_size = get_pip_size(trade['symbol'])
                         
                         if trade['side'] == "LONG":
