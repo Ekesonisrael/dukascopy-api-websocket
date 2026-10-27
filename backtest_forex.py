@@ -5,43 +5,36 @@ import yfinance as yf
 # ==========================================
 # CONFIGURATION
 # ==========================================
-SYMBOLS = {"GC=F": "Gold"}  # Yahoo Finance ticker for Gold
+SYMBOLS = {"GC=F": "Gold Futures"}  # Gold proxy
 RISK_REWARD = 2.0
 ATR_MULTIPLIER = 1.5
 VOLUME_MULTIPLIER = 1.5
-FEE_RATE = 0.0001
+FEE_RATE = 0.0001 
+
 TRADING_HOURS_START = 13
 TRADING_HOURS_END = 17
 
-# We will test 1 year (approx 365 days)
-PERIOD = "1y" 
-INTERVAL = "1h"  # 1-Hour data is the deepest Yahoo allows for intraday
+# ✅ CHANGED: Looking back exactly 30 days
+PERIOD = "30d"
+INTERVAL = "15m" 
 
 def run_backtest(ticker, name):
     print(f"\nFetching {PERIOD} of {INTERVAL} data for {name} ({ticker})...")
     
-    # Download 1 year of 1H data
     df = yf.download(ticker, period=PERIOD, interval=INTERVAL, progress=False)
     
     if df.empty:
-        print(f"❌ Failed to fetch data. Trying {INTERVAL} fallback...")
-        # Fallback to 1H if 1h fails (though it shouldn't)
-        df = yf.download(ticker, period="2y", interval="1h", progress=False)
-        if df.empty:
-            print("❌ Fallback also failed. Yahoo may be rate-limiting. Try again later.")
-            return
+        print(f"❌ Failed to fetch data for {ticker}.")
+        return
 
-    # Flatten columns if multi-index
     if isinstance(df.columns, pd.MultiIndex): 
         df.columns = df.columns.droplevel(1)
     df.reset_index(inplace=True)
     
-    # Ensure datetime column exists
-    date_col = 'Datetime' if 'Datetime' in df.columns else 'Date'
-    df['Datetime'] = pd.to_datetime(df[date_col])
+    df['Datetime'] = pd.to_datetime(df['Datetime'])
     df.set_index('Datetime', inplace=True)
 
-    # Resample to 4H for trend (1H data resamples perfectly)
+    # Resample to 4H for the trend
     df_4h = df.resample('4h').agg({'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last'}).dropna()
     df_4h['ema20'] = df_4h['Close'].ewm(span=20, adjust=False).mean()
     df_4h['ema50'] = df_4h['Close'].ewm(span=50, adjust=False).mean()
@@ -49,7 +42,7 @@ def run_backtest(ticker, name):
     
     df.reset_index(inplace=True)
 
-    # ATR and Volume MA on 1H
+    # ATR and Volume MA on 15m
     df['high_low'] = df['High'] - df['Low']
     df['high_close'] = (df['High'] - df['Close'].shift()).abs()
     df['low_close'] = (df['Low'] - df['Close'].shift()).abs()
@@ -81,7 +74,6 @@ def run_backtest(ticker, name):
         trade_entered = False
         side = None
 
-        # Sweep logic
         swept_low = (sweep_row['Low'] < sweep_row['recent_low']) and (sweep_row['Close'] > sweep_row['recent_low']) and (sweep_row['Volume'] > sweep_row['vol_ma'] * VOLUME_MULTIPLIER)
         swept_high = (sweep_row['High'] > sweep_row['recent_high']) and (sweep_row['Close'] < sweep_row['recent_high']) and (sweep_row['Volume'] > sweep_row['vol_ma'] * VOLUME_MULTIPLIER)
 
@@ -138,14 +130,14 @@ def run_backtest(ticker, name):
             i += 1
 
     if not trades:
-        print("No trades found.")
+        print("No trades found in this period.")
         return
 
     total = len(trades)
     wins = sum(1 for t in trades if t['result'] == 'WIN')
     total_r = sum(t['r'] for t in trades)
 
-    print(f"=== {name} 1-YEAR BACKTEST (1H) ===")
+    print(f"=== {name} 30-DAY BACKTEST (15m) ===")
     print(f"Total Trades: {total} | Wins: {wins} | Win Rate: {(wins/total)*100:.2f}%")
     print(f"Total R: {total_r:+.2f}R | Avg R: {(total_r/total):+.2f}R")
 
