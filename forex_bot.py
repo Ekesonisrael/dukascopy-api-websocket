@@ -19,8 +19,6 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 SYMBOLS = [
     "XAUUSD", "XAUUSDm",     # Gold
     "EURUSD", "EURUSDm",     # Euro
-    "GBPUSD", "GBPUSDm",     # Pound
-    "USDJPY", "USDJPYm"      # Yen
 ]
 
 JOURNAL_FILE = "forex_journal.json"
