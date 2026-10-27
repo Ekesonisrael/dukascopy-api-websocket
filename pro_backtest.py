@@ -3,18 +3,13 @@ import numpy as np
 import yfinance as yf
 
 # ==========================================
-# CONFIGURATION
+# CONFIGURATION (GOLD ONLY)
 # ==========================================
-SYMBOLS = {
-    "GC=F": "Gold",
-    "BTC-USD": "Bitcoin",
-    "SOL-USD": "Solana"
-}
-
-RISK_REWARD = 2.0
+SYMBOLS = {"GC=F": "Gold"}
+RISK_REWARD = 2.5       # ✅ Increased from 2.0
 ATR_MULTIPLIER = 1.5
 VOLUME_MULTIPLIER = 1.5
-FEE_RATE = 0.0010  # ✅ PRO-TRADER FIX: 0.1% fee + slippage per trade (brutal)
+FEE_RATE = 0.0010       # ✅ Brutal 0.1% fee/spread model
 TRADING_HOURS_START = 13
 TRADING_HOURS_END = 17
 
@@ -44,10 +39,9 @@ def run_backtest(ticker, name, split=False):
     df['4h_time'] = df['Datetime'].dt.floor('4h')
     df = pd.merge_asof(df, df_4h[['trend']], left_on='4h_time', right_index=True, direction='backward')
 
-    # ✅ OUT-OF-SAMPLE SPLIT
     if split:
         mid_point = len(df) // 2
-        df = df.iloc[mid_point:].reset_index(drop=True) # Test only on the SECOND half
+        df = df.iloc[mid_point:].reset_index(drop=True) 
         print(f"\n--- {name} (OUT-OF-SAMPLE: Last 30 Days) ---")
     else:
         print(f"\n--- {name} (IN-SAMPLE: Full 60 Days) ---")
@@ -82,28 +76,50 @@ def run_backtest(ticker, name, split=False):
             risk = abs(entry - sl)
             tp = entry + (risk * RISK_REWARD) if side == 'LONG' else entry - (risk * RISK_REWARD)
             
-            # Brutal Fee Calculation
             cost_r = FEE_RATE / (risk / entry) 
+
+            # ✅ NEW BREAK-EVEN LOGIC
+            breakeven_triggered = False
 
             for j in range(i+2, len(df)):
                 candle = df.iloc[j]
+                
                 if side == 'LONG':
-                    if candle['Low'] <= sl: trades.append(-1.0 - cost_r); i = j; break
-                    elif candle['High'] >= tp: trades.append(RISK_REWARD - cost_r); i = j; break
+                    # Move SL to entry if we hit 1R in profit
+                    if not breakeven_triggered and candle['High'] >= entry + risk:
+                        sl = entry + (entry * FEE_RATE) # Move to Breakeven + fees
+                        breakeven_triggered = True
+                        
+                    if candle['Low'] <= sl:
+                        net_r = 0.0 if breakeven_triggered else -1.0
+                        trades.append(net_r - cost_r)
+                        i = j; break
+                    elif candle['High'] >= tp:
+                        trades.append(RISK_REWARD - cost_r)
+                        i = j; break
+                        
                 elif side == 'SHORT':
-                    if candle['High'] >= sl: trades.append(-1.0 - cost_r); i = j; break
-                    elif candle['Low'] <= tp: trades.append(RISK_REWARD - cost_r); i = j; break
+                    # Move SL to entry if we hit 1R in profit
+                    if not breakeven_triggered and candle['Low'] <= entry - risk:
+                        sl = entry - (entry * FEE_RATE) # Move to Breakeven + fees
+                        breakeven_triggered = True
+                        
+                    if candle['High'] >= sl:
+                        net_r = 0.0 if breakeven_triggered else -1.0
+                        trades.append(net_r - cost_r)
+                        i = j; break
+                    elif candle['Low'] <= tp:
+                        trades.append(RISK_REWARD - cost_r)
+                        i = j; break
             else: i += 1
         else: i += 1
 
     if not trades: return
 
-    # ✅ PROFESSIONAL METRICS
     total_trades = len(trades)
     wins = sum(1 for r in trades if r > 0)
     total_r = sum(trades)
     
-    # Calculate Max Drawdown
     cumulative_r = np.cumsum(trades)
     running_max = np.maximum.accumulate(cumulative_r)
     drawdown = cumulative_r - running_max
@@ -114,7 +130,5 @@ def run_backtest(ticker, name, split=False):
 
 if __name__ == "__main__":
     for ticker, name in SYMBOLS.items():
-        # 1. Run full 60 days
         run_backtest(ticker, name, split=False)
-        # 2. Run out-of-sample (last 30 days only) to prove it didn't just memorize the first 30 days
         run_backtest(ticker, name, split=True)
