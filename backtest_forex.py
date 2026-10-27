@@ -6,25 +6,26 @@ import numpy as np
 # CONFIGURATION
 # ==========================================
 SYMBOLS = {
-    "GC=F": "Gold Futures",    # XAUUSD proxy
-    "EURUSD=X": "Euro/USD"
+    "GC=F": "Gold Futures" # Only testing Gold
 }
 RISK_REWARD = 2.0
 ATR_MULTIPLIER = 1.5
 FEE_RATE = 0.0001 
 
-# ✅ NEW: Trading Hours (UTC)
-# 13:00 to 17:00 UTC covers the London/NY overlap
 TRADING_HOURS_START = 13
 TRADING_HOURS_END = 17
 
-def run_backtest(ticker, name):
-    print(f"\nFetching data for {name} ({ticker})...")
+# ✅ ADDED: List of time periods to test
+PERIODS = ["30d", "60d", "3mo", "6mo", "1y"]
+
+def run_backtest(ticker, name, period):
+    print(f"\nFetching {period} of data for {name} ({ticker})...")
     
-    df = yf.download(ticker, period="60d", interval="15m", progress=False)
+    # ✅ CHANGED: We must use 1h data to go past 60 days
+    df = yf.download(ticker, period=period, interval="1h", progress=False)
     
     if df.empty:
-        print(f"Failed to fetch data for {ticker}")
+        print(f"Failed to fetch data for {ticker} ({period})")
         return
 
     if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.droplevel(1)
@@ -33,6 +34,7 @@ def run_backtest(ticker, name):
     df['Datetime'] = pd.to_datetime(df['Datetime'])
     df.set_index('Datetime', inplace=True)
     
+    # Resample to 4H for the trend
     df_4h = df.resample('4h').agg({'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last'}).dropna()
     df_4h['ema20'] = df_4h['Close'].ewm(span=20, adjust=False).mean()
     df_4h['ema50'] = df_4h['Close'].ewm(span=50, adjust=False).mean()
@@ -40,6 +42,7 @@ def run_backtest(ticker, name):
     
     df.reset_index(inplace=True)
     
+    # Calculate ATR on 1H
     df['high_low'] = df['High'] - df['Low']
     df['high_close'] = (df['High'] - df['Close'].shift()).abs()
     df['low_close'] = (df['Low'] - df['Close'].shift()).abs()
@@ -53,14 +56,13 @@ def run_backtest(ticker, name):
     df = pd.merge_asof(df, df_4h[['trend']], left_on='4h_time', right_index=True, direction='backward')
 
     trades = []
-    i = 20
+    i = 50 # Start at 50 to ensure EMA is ready
 
     while i < len(df) - 2:
         sweep_row = df.iloc[i]
         conf_row = df.iloc[i+1]
         entry_row = df.iloc[i+2]
 
-        # ✅ NEW: Check if the sweep happened during high-volume hours
         current_hour = sweep_row['Datetime'].hour
         if not (TRADING_HOURS_START <= current_hour < TRADING_HOURS_END):
             i += 1
@@ -125,17 +127,18 @@ def run_backtest(ticker, name):
             i += 1
 
     if not trades:
-        print("No trades found.")
+        print(f"=== {name} ({period}) === No trades found.")
         return
 
     total = len(trades)
     wins = sum(1 for t in trades if t['result'] == 'WIN')
     total_r = sum(t['r'] for t in trades)
 
-    print(f"=== {name} BACKTEST RESULTS (Session Filter) ===")
+    print(f"=== {name} ({period} BACKTEST) ===")
     print(f"Total Trades: {total} | Wins: {wins} | Win Rate: {(wins/total)*100:.2f}%")
     print(f"Total R: {total_r:+.2f}R | Avg R: {(total_r/total):+.2f}R")
 
 if __name__ == "__main__":
     for ticker, name in SYMBOLS.items():
-        run_backtest(ticker, name)
+        for period in PERIODS:
+            run_backtest(ticker, name, period)
