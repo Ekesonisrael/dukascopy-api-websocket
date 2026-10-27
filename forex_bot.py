@@ -1,6 +1,6 @@
 import os
 import pandas as pd
-import numpy as np # Added for ATR
+import numpy as np 
 import json
 import time
 from datetime import datetime, timezone, timedelta
@@ -17,13 +17,17 @@ MT5_PASSWORD = os.getenv("MT5_PASSWORD")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-SYMBOLS = ["XAUUSD", "XAUUSDm", "EURUSD", "EURUSDm"]
+# ✅ ONLY GOLD
+SYMBOLS = ["XAUUSD", "XAUUSDm"]
 JOURNAL_FILE = "forex_journal.json"
 
-# ✅ NEW WINNING PARAMETERS
 RISK_REWARD = 2.0
 ATR_MULTIPLIER = 1.5
 VOLUME_MULTIPLIER = 1.5
+
+# ✅ LONDON/NY OVERLAP (UTC)
+TRADING_HOURS_START = 13
+TRADING_HOURS_END = 17
 
 def is_market_open():
     now = datetime.now(timezone.utc)
@@ -56,7 +60,6 @@ def save_journal(journal):
     with open(JOURNAL_FILE, "w") as f: json.dump(journal, f, indent=4)
 
 def check_closed_trades(client, account_id, journal):
-    # (Leave this function exactly as you have it, it works fine for MT5)
     updated = False
     try:
         detail = client.accounts.get(account_id)
@@ -111,7 +114,12 @@ def run_strategy():
         print(f"--- Market is CLOSED (Weekend). Sleeping... ---")
         return 
 
-    print(f"--- Market is OPEN. Starting Session at {datetime.now()} ---")
+    current_utc_hour = datetime.now(timezone.utc).hour
+    if not (TRADING_HOURS_START <= current_utc_hour < TRADING_HOURS_END):
+        print(f"--- Outside Trading Session (Current UTC Hour: {current_utc_hour}). Sleeping... ---")
+        return
+
+    print(f"--- Session OPEN. Starting Scan at {datetime.now()} ---")
     
     client = Tickerall(api_key=TICKERALL_API_KEY, timeout=60)
     
@@ -140,7 +148,6 @@ def run_strategy():
         
         for attempt in range(2):
             try:
-                # ✅ NEW: Fetching volume data as well
                 candles_4h = client.candles.get(account_id, symbol=symbol, count=50, timeframe="H4")
                 candles_15m = client.candles.get(account_id, symbol=symbol, count=50, timeframe="M15")
                 df_4h = pd.DataFrame([{'open': c.open, 'high': c.high, 'low': c.low, 'close': c.close, 'vol': getattr(c, 'volume', 1)} for c in candles_4h])
@@ -158,7 +165,7 @@ def run_strategy():
         is_bullish = df_4h['ema20'].iloc[-1] > df_4h['ema50'].iloc[-1]
         is_bearish = df_4h['ema20'].iloc[-1] < df_4h['ema50'].iloc[-1]
 
-        # ✅ NEW: Calculate ATR and Volume MA on 15M
+        # ATR and Volume MA
         df_15m['high_low'] = df_15m['high'] - df_15m['low']
         df_15m['high_close'] = (df_15m['high'] - df_15m['close'].shift()).abs()
         df_15m['low_close'] = (df_15m['low'] - df_15m['close'].shift()).abs()
@@ -166,18 +173,15 @@ def run_strategy():
         df_15m['atr'] = df_15m['tr'].rolling(window=14).mean()
         df_15m['vol_ma'] = df_15m['vol'].rolling(window=20).mean()
 
-        # ✅ NEW: Evaluate previous closed candle for sweep, last closed for confirmation
         sweep_candle = df_15m.iloc[-2]
         conf_candle = df_15m.iloc[-1]
         
         recent_low = float(df_15m['low'].iloc[-20:-2].min())
         recent_high = float(df_15m['high'].iloc[-20:-2].max())
 
-        # Sweep Logic + Volume Filter
         swept_low = (sweep_candle['low'] < recent_low) and (sweep_candle['close'] > recent_low) and (sweep_candle['vol'] > sweep_candle['vol_ma'] * VOLUME_MULTIPLIER)
         swept_high = (sweep_candle['high'] > recent_high) and (sweep_candle['close'] < recent_high) and (sweep_candle['vol'] > sweep_candle['vol_ma'] * VOLUME_MULTIPLIER)
 
-        # Confirmation (Green candle for Long, Red candle for Short)
         confirm_long = conf_candle['close'] > conf_candle['open']
         confirm_short = conf_candle['close'] < conf_candle['open']
 
@@ -187,13 +191,11 @@ def run_strategy():
         signal = None
         if is_bullish and swept_low and confirm_long:
             signal = "LONG"
-            # ✅ NEW: ATR Stop Loss
             sl = current_price - (atr_value * ATR_MULTIPLIER)
             risk = current_price - sl
             tp = current_price + (risk * RISK_REWARD)
         elif is_bearish and swept_high and confirm_short:
             signal = "SHORT"
-            # ✅ NEW: ATR Stop Loss
             sl = current_price + (atr_value * ATR_MULTIPLIER)
             risk = sl - current_price
             tp = current_price - (risk * RISK_REWARD)
