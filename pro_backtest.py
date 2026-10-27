@@ -6,10 +6,10 @@ import yfinance as yf
 # CONFIGURATION (GOLD ONLY)
 # ==========================================
 SYMBOLS = {"GC=F": "Gold"}
-RISK_REWARD = 2.5       # ✅ Increased from 2.0
+RISK_REWARD = 2.0       # ✅ Back to 2.0
 ATR_MULTIPLIER = 1.5
 VOLUME_MULTIPLIER = 1.5
-FEE_RATE = 0.0010       # ✅ Brutal 0.1% fee/spread model
+FEE_RATE = 0.0010       # ✅ Keeping the Brutal 0.1% fee
 TRADING_HOURS_START = 13
 TRADING_HOURS_END = 17
 
@@ -78,35 +78,21 @@ def run_backtest(ticker, name, split=False):
             
             cost_r = FEE_RATE / (risk / entry) 
 
-            # ✅ NEW BREAK-EVEN LOGIC
-            breakeven_triggered = False
-
+            # ✅ NO BREAK-EVEN LOGIC. Pure SL and TP.
             for j in range(i+2, len(df)):
                 candle = df.iloc[j]
                 
                 if side == 'LONG':
-                    # Move SL to entry if we hit 1R in profit
-                    if not breakeven_triggered and candle['High'] >= entry + risk:
-                        sl = entry + (entry * FEE_RATE) # Move to Breakeven + fees
-                        breakeven_triggered = True
-                        
                     if candle['Low'] <= sl:
-                        net_r = 0.0 if breakeven_triggered else -1.0
-                        trades.append(net_r - cost_r)
+                        trades.append(-1.0 - cost_r)
                         i = j; break
                     elif candle['High'] >= tp:
                         trades.append(RISK_REWARD - cost_r)
                         i = j; break
                         
                 elif side == 'SHORT':
-                    # Move SL to entry if we hit 1R in profit
-                    if not breakeven_triggered and candle['Low'] <= entry - risk:
-                        sl = entry - (entry * FEE_RATE) # Move to Breakeven + fees
-                        breakeven_triggered = True
-                        
                     if candle['High'] >= sl:
-                        net_r = 0.0 if breakeven_triggered else -1.0
-                        trades.append(net_r - cost_r)
+                        trades.append(-1.0 - cost_r)
                         i = j; break
                     elif candle['Low'] <= tp:
                         trades.append(RISK_REWARD - cost_r)
