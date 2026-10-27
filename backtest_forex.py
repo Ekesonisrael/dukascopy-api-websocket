@@ -1,104 +1,79 @@
-import os
 import pandas as pd
 import numpy as np
-from datetime import datetime
-from tickerall import Tickerall
+import yfinance as yf
 
 # ==========================================
 # CONFIGURATION
 # ==========================================
-TICKERALL_API_KEY = os.getenv("TICKERALL_API_KEY")
-MT5_SERVER = os.getenv("MT5_SERVER")
-MT5_ACCOUNT = int(os.getenv("MT5_ACCOUNT"))
-MT5_PASSWORD = os.getenv("MT5_PASSWORD")
-
-SYMBOL = "XAUUSD"
+SYMBOLS = {"GC=F": "Gold"}  # Yahoo Finance ticker for Gold
 RISK_REWARD = 2.0
 ATR_MULTIPLIER = 1.5
 VOLUME_MULTIPLIER = 1.5
 FEE_RATE = 0.0001
-
 TRADING_HOURS_START = 13
 TRADING_HOURS_END = 17
 
-def run_backtest():
-    print("Connecting to MT5...")
+# We will test 1 year (approx 365 days)
+PERIOD = "1y" 
+INTERVAL = "1h"  # 1-Hour data is the deepest Yahoo allows for intraday
+
+def run_backtest(ticker, name):
+    print(f"\nFetching {PERIOD} of {INTERVAL} data for {name} ({ticker})...")
     
-    client = Tickerall(api_key=TICKERALL_API_KEY, timeout=60)
-    try:
-        session = client.sessions.start(
-            broker="mt5", server=MT5_SERVER, account=MT5_ACCOUNT,
-            password=MT5_PASSWORD, terminal_type="MOBILE"
-        )
-        account_id = session.account_id
-    except Exception as e:
-        print(f"Failed to connect to MT5: {e}")
-        return
-
-    # Try 200 days, then 90 days, then 30 days to prevent empty data
-    lookbacks = [4800, 2160, 720] 
-    candles_15m = []
+    # Download 1 year of 1H data
+    df = yf.download(ticker, period=PERIOD, interval=INTERVAL, progress=False)
     
-    for hours in lookbacks:
-        print(f"Attempting to fetch {hours} hours (approx {hours//24} days) of 15m data...")
-        try:
-            candles_15m = client.candles.get(
-                account_id, symbol=SYMBOL, hours=hours, timeframe="M15"
-            )
-            if candles_15m:
-                print(f"✅ Successfully fetched {len(candles_15m)} candles!")
-                break
-        except Exception as e:
-            print(f"Fetch failed for {hours} hours: {e}")
+    if df.empty:
+        print(f"❌ Failed to fetch data. Trying {INTERVAL} fallback...")
+        # Fallback to 1H if 1h fails (though it shouldn't)
+        df = yf.download(ticker, period="2y", interval="1h", progress=False)
+        if df.empty:
+            print("❌ Fallback also failed. Yahoo may be rate-limiting. Try again later.")
+            return
 
-    if not candles_15m:
-        print("❌ No data returned. Your broker might not provide M15 history via API.")
-        return
+    # Flatten columns if multi-index
+    if isinstance(df.columns, pd.MultiIndex): 
+        df.columns = df.columns.droplevel(1)
+    df.reset_index(inplace=True)
+    
+    # Ensure datetime column exists
+    date_col = 'Datetime' if 'Datetime' in df.columns else 'Date'
+    df['Datetime'] = pd.to_datetime(df[date_col])
+    df.set_index('Datetime', inplace=True)
 
-    print("Processing data and running backtest...")
-
-    # Build DataFrame
-    df = pd.DataFrame([{
-        'time': c.time, 'open': c.open, 'high': c.high, 'low': c.low, 'close': c.close, 'vol': getattr(c, 'volume', 1)
-    } for c in candles_15m])
-
-    df['time'] = pd.to_datetime(df['time'])
-    df.set_index('time', inplace=True)
-
-    # Resample to 4H for trend
-    df_4h = df.resample('4h').agg({'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last'}).dropna()
-    df_4h['ema20'] = df_4h['close'].ewm(span=20, adjust=False).mean()
-    df_4h['ema50'] = df_4h['close'].ewm(span=50, adjust=False).mean()
+    # Resample to 4H for trend (1H data resamples perfectly)
+    df_4h = df.resample('4h').agg({'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last'}).dropna()
+    df_4h['ema20'] = df_4h['Close'].ewm(span=20, adjust=False).mean()
+    df_4h['ema50'] = df_4h['Close'].ewm(span=50, adjust=False).mean()
     df_4h['trend'] = np.where(df_4h['ema20'] > df_4h['ema50'], 1, -1)
-
+    
     df.reset_index(inplace=True)
 
-    # Calculate ATR and Vol MA on 15M
-    df['high_low'] = df['high'] - df['low']
-    df['high_close'] = (df['high'] - df['close'].shift()).abs()
-    df['low_close'] = (df['low'] - df['close'].shift()).abs()
+    # ATR and Volume MA on 1H
+    df['high_low'] = df['High'] - df['Low']
+    df['high_close'] = (df['High'] - df['Close'].shift()).abs()
+    df['low_close'] = (df['Low'] - df['Close'].shift()).abs()
     df['tr'] = df[['high_low', 'high_close', 'low_close']].max(axis=1)
     df['atr'] = df['tr'].rolling(window=14).mean()
-    df['vol_ma'] = df['vol'].rolling(window=20).mean()
+    df['vol_ma'] = df['Volume'].rolling(window=20).mean()
 
-    df['recent_low'] = df['low'].rolling(window=20).min().shift(1)
-    df['recent_high'] = df['high'].rolling(window=20).max().shift(1)
+    df['recent_low'] = df['Low'].rolling(window=20).min().shift(1)
+    df['recent_high'] = df['High'].rolling(window=20).max().shift(1)
 
     # Merge 4H Trend
-    df['4h_time'] = df['time'].dt.floor('4h')
+    df['4h_time'] = df['Datetime'].dt.floor('4h')
     df = pd.merge_asof(df, df_4h[['trend']], left_on='4h_time', right_index=True, direction='backward')
 
     trades = []
     i = 50 
 
-    # The Backtest Loop
     while i < len(df) - 2:
         sweep_row = df.iloc[i]
         conf_row = df.iloc[i+1]
         entry_row = df.iloc[i+2]
 
-        # Session Filter
-        current_hour = sweep_row['time'].hour
+        # Session Filter (13:00 - 17:00 UTC)
+        current_hour = sweep_row['Datetime'].hour
         if not (TRADING_HOURS_START <= current_hour < TRADING_HOURS_END):
             i += 1
             continue
@@ -106,14 +81,15 @@ def run_backtest():
         trade_entered = False
         side = None
 
-        swept_low = (sweep_row['low'] < sweep_row['recent_low']) and (sweep_row['close'] > sweep_row['recent_low']) and (sweep_row['vol'] > sweep_row['vol_ma'] * VOLUME_MULTIPLIER)
-        swept_high = (sweep_row['high'] > sweep_row['recent_high']) and (sweep_row['close'] < sweep_row['recent_high']) and (sweep_row['vol'] > sweep_row['vol_ma'] * VOLUME_MULTIPLIER)
+        # Sweep logic
+        swept_low = (sweep_row['Low'] < sweep_row['recent_low']) and (sweep_row['Close'] > sweep_row['recent_low']) and (sweep_row['Volume'] > sweep_row['vol_ma'] * VOLUME_MULTIPLIER)
+        swept_high = (sweep_row['High'] > sweep_row['recent_high']) and (sweep_row['Close'] < sweep_row['recent_high']) and (sweep_row['Volume'] > sweep_row['vol_ma'] * VOLUME_MULTIPLIER)
 
-        conf_long = conf_row['close'] > conf_row['open']
-        conf_short = conf_row['close'] < conf_row['open']
+        conf_long = conf_row['Close'] > conf_row['Open']
+        conf_short = conf_row['Close'] < conf_row['Open']
 
         if sweep_row['trend'] == 1 and swept_low and conf_long:
-            entry = entry_row['open']
+            entry = entry_row['Open']
             sl = entry - (sweep_row['atr'] * ATR_MULTIPLIER)
             risk = entry - sl
             tp = entry + (risk * RISK_REWARD)
@@ -121,7 +97,7 @@ def run_backtest():
             side = 'LONG'
             
         elif sweep_row['trend'] == -1 and swept_high and conf_short:
-            entry = entry_row['open']
+            entry = entry_row['Open']
             sl = entry + (sweep_row['atr'] * ATR_MULTIPLIER)
             risk = sl - entry
             tp = entry - (risk * RISK_REWARD)
@@ -137,18 +113,18 @@ def run_backtest():
                 candle = df.iloc[j]
                 
                 if side == 'LONG':
-                    if candle['low'] <= sl:
+                    if candle['Low'] <= sl:
                         result = 'LOSS'
                         exit_idx = j; break
-                    elif candle['high'] >= tp:
+                    elif candle['High'] >= tp:
                         result = 'WIN'
                         exit_idx = j; break
                         
                 elif side == 'SHORT':
-                    if candle['high'] >= sl:
+                    if candle['High'] >= sl:
                         result = 'LOSS'
                         exit_idx = j; break
-                    elif candle['low'] <= tp:
+                    elif candle['Low'] <= tp:
                         result = 'WIN'
                         exit_idx = j; break
 
@@ -162,19 +138,17 @@ def run_backtest():
             i += 1
 
     if not trades:
-        print("No trades found in this data period.")
+        print("No trades found.")
         return
 
     total = len(trades)
     wins = sum(1 for t in trades if t['result'] == 'WIN')
     total_r = sum(t['r'] for t in trades)
 
-    print(f"\n=========================================")
-    print(f"=== {SYMBOL} BACKTEST RESULTS ===")
-    print(f"=========================================")
-    print(f"Total Trades: {total}")
-    print(f"Wins: {wins} | Win Rate: {(wins/total)*100:.2f}%")
+    print(f"=== {name} 1-YEAR BACKTEST (1H) ===")
+    print(f"Total Trades: {total} | Wins: {wins} | Win Rate: {(wins/total)*100:.2f}%")
     print(f"Total R: {total_r:+.2f}R | Avg R: {(total_r/total):+.2f}R")
 
 if __name__ == "__main__":
-    run_backtest()
+    for ticker, name in SYMBOLS.items():
+        run_backtest(ticker, name)
