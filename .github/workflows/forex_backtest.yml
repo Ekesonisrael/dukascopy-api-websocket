@@ -19,11 +19,12 @@ jobs:
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pandas numpy yfinance
-
-      # 🛑 DEBUG STEP: This will list every file the runner sees
-      - name: List Files
-        run: ls -la
+          pip install -r requirements.txt
 
       - name: Run Forex Backtest Script
+        env:
+          TICKERALL_API_KEY: ${{ secrets.TICKERALL_API_KEY }}
+          MT5_SERVER: ${{ secrets.MT5_SERVER }}
+          MT5_ACCOUNT: ${{ secrets.MT5_ACCOUNT }}
+          MT5_PASSWORD: ${{ secrets.MT5_PASSWORD }}
         run: python backtest_forex.py
