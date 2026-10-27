@@ -11,23 +11,25 @@ SYMBOLS = {
 }
 RISK_REWARD = 2.0
 ATR_MULTIPLIER = 1.5
-FEE_RATE = 0.0001 # Spread equivalent
+FEE_RATE = 0.0001 
+
+# ✅ NEW: Trading Hours (UTC)
+# 13:00 to 17:00 UTC covers the London/NY overlap
+TRADING_HOURS_START = 13
+TRADING_HOURS_END = 17
 
 def run_backtest(ticker, name):
     print(f"\nFetching data for {name} ({ticker})...")
     
-    # Fetch 15m data
     df = yf.download(ticker, period="60d", interval="15m", progress=False)
     
     if df.empty:
         print(f"Failed to fetch data for {ticker}")
         return
 
-    # Flatten multi-index columns
     if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.droplevel(1)
     df.reset_index(inplace=True)
     
-    # Create 4H Trend data by resampling the 15m data
     df['Datetime'] = pd.to_datetime(df['Datetime'])
     df.set_index('Datetime', inplace=True)
     
@@ -38,7 +40,6 @@ def run_backtest(ticker, name):
     
     df.reset_index(inplace=True)
     
-    # Calculate ATR on 15M
     df['high_low'] = df['High'] - df['Low']
     df['high_close'] = (df['High'] - df['Close'].shift()).abs()
     df['low_close'] = (df['Low'] - df['Close'].shift()).abs()
@@ -48,7 +49,6 @@ def run_backtest(ticker, name):
     df['recent_low'] = df['Low'].rolling(window=20).min().shift(1)
     df['recent_high'] = df['High'].rolling(window=20).max().shift(1)
 
-    # Merge Trend onto 15m data using 4H timestamps
     df['4h_time'] = df['Datetime'].dt.floor('4h')
     df = pd.merge_asof(df, df_4h[['trend']], left_on='4h_time', right_index=True, direction='backward')
 
@@ -60,14 +60,18 @@ def run_backtest(ticker, name):
         conf_row = df.iloc[i+1]
         entry_row = df.iloc[i+2]
 
+        # ✅ NEW: Check if the sweep happened during high-volume hours
+        current_hour = sweep_row['Datetime'].hour
+        if not (TRADING_HOURS_START <= current_hour < TRADING_HOURS_END):
+            i += 1
+            continue
+
         trade_entered = False
         side = None
 
-        # Sweep Filters (No Volume Filter for Forex)
         swept_low = (sweep_row['Low'] < sweep_row['recent_low']) and (sweep_row['Close'] > sweep_row['recent_low'])
         swept_high = (sweep_row['High'] > sweep_row['recent_high']) and (sweep_row['Close'] < sweep_row['recent_high'])
 
-        # Confirmation
         conf_long = conf_row['Close'] > conf_row['Open']
         conf_short = conf_row['Close'] < conf_row['Open']
 
@@ -128,7 +132,7 @@ def run_backtest(ticker, name):
     wins = sum(1 for t in trades if t['result'] == 'WIN')
     total_r = sum(t['r'] for t in trades)
 
-    print(f"=== {name} BACKTEST RESULTS ===")
+    print(f"=== {name} BACKTEST RESULTS (Session Filter) ===")
     print(f"Total Trades: {total} | Wins: {wins} | Win Rate: {(wins/total)*100:.2f}%")
     print(f"Total R: {total_r:+.2f}R | Avg R: {(total_r/total):+.2f}R")
 
