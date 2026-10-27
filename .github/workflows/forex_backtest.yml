@@ -1,10 +1,7 @@
 name: Run Forex Backtest
 
 on:
-  workflow_dispatch: # This allows you to run it manually with a button click
-  # (Optional) Uncomment the lines below if you want it to run automatically once a week on Sundays
-  # schedule:
-  #   - cron: '0 0 * * 0'
+  workflow_dispatch: 
 
 jobs:
   run-backtest:
@@ -22,8 +19,11 @@ jobs:
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          # Installing the required packages directly to ensure it works even if requirements.txt isn't updated
           pip install pandas numpy yfinance
+
+      # 🛑 DEBUG STEP: This will list every file the runner sees
+      - name: List Files
+        run: ls -la
 
       - name: Run Forex Backtest Script
         run: python backtest_forex.py
