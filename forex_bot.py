@@ -17,18 +17,21 @@ MT5_PASSWORD = os.getenv("MT5_PASSWORD")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# ✅ ONLY GOLD
-SYMBOLS = ["XAUUSD", "XAUUSDm"] 
+SYMBOLS = ["XAUUSD", "XAUUSDm"]
 JOURNAL_FILE = "forex_journal.json"
 
-# ✅ THE EXACT LOGIC WE BACKTESTED
 RISK_REWARD = 2.0
 ATR_MULTIPLIER = 1.5
-VOLUME_MULTIPLIER = 1.5
 
-# ✅ LONDON/NY OVERLAP (UTC)
-TRADING_HOURS_START = 13
-TRADING_HOURS_END = 17
+# ✅ AGGRESSIVE MODE: Volume filter turned off
+VOLUME_MULTIPLIER = 0.1 
+
+# ✅ AGGRESSIVE MODE: 24-Hour Trading (No session filter)
+TRADING_HOURS_START = 0
+TRADING_HOURS_END = 24
+
+# Global variable for debug cooldown
+last_forex_telegram_time = 0
 
 def is_market_open():
     now = datetime.now(timezone.utc)
@@ -42,7 +45,7 @@ def send_telegram(msg):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID: return
     import requests
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    try: requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=10)
+    try: requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"}, timeout=10)
     except Exception as e: print(f"Telegram Error: {e}")
 
 def get_pip_size(symbol):
@@ -63,61 +66,38 @@ def save_journal(journal):
 def check_closed_trades(client, account_id, journal):
     updated = False
     try:
-        detail = client.accounts.get(account_id)
-        open_positions = detail.positions if hasattr(detail, 'positions') else []
-        open_symbols = [p.symbol for p in open_positions]
+        positions = client.positions.get(account_id)
+        open_symbols = [p.symbol for p in positions] if positions else []
         
         for trade in journal:
             if trade['status'] == "OPEN":
                 if trade['symbol'] not in open_symbols:
-                    trades = client.history.get(account_id, symbol=trade['symbol'], limit=50)
-                    exit_deal = None
-                    if trades:
-                        for deal in trades:
-                            entry_attr = getattr(deal, 'entry', None)
-                            type_attr = getattr(deal, 'type', None)
-                            is_exit = entry_attr in [1, 'OUT', 'out'] or (type_attr in [1, 'SELL', 'sell'] and entry_attr != 0)
-                            if is_exit:
-                                exit_deal = deal
-                                break
-                    
-                    if exit_deal:
-                        close_price = getattr(exit_deal, 'price', trade['entry'])
-                        profit = getattr(exit_deal, 'profit', 0.0)
-                        pip_size = get_pip_size(trade['symbol'])
-                        if trade['side'] == "LONG": pips = (close_price - trade['entry']) / pip_size
-                        else: pips = (trade['entry'] - close_price) / pip_size
-                            
-                        result_emoji = "🟢 WIN" if profit > 0 else "🔴 LOSS"
-                        report = (
-                            f"🔔 *TRADE CLOSED: {trade['symbol']}*\n\n"
-                            f"Result: {result_emoji}\n"
-                            f"Side: {trade['side']}\n"
-                            f"Entry: {trade['entry']:.5f}\n"
-                            f"Exit: {close_price:.5f}\n"
-                            f"Pips: {pips:+.1f}\n"
-                            f"Profit: ${profit:+.2f}\n\n"
-                            f"🧠 Strategy: ATR Sweep"
-                        )
-                        send_telegram(report)
-                        print(report)
-                    else:
-                        send_telegram(f"🔔 {trade['symbol']} trade closed. Check Exness app for PnL.")
+                    report = (
+                        f"🔔 *TRADE CLOSED: {trade['symbol']}*\n\n"
+                        f"Check your Exness app for the final PnL.\n"
+                        f"Entry was: {trade['entry']:.5f}\n"
+                        f"🧠 Strategy: ATR Sweep"
+                    )
+                    send_telegram(report)
+                    print(report)
                     
                     trade['status'] = "CLOSED"
                     updated = True
     except Exception as e:
         print(f"Error resolving history: {e}")
+        
     return updated
 
 def run_strategy():
+    global last_forex_telegram_time
+    
     if not is_market_open():
         print(f"--- Market is CLOSED (Weekend). Sleeping... ---")
         return 
 
+    # With TRADING_HOURS_START=0 and END=24, this will always pass
     current_utc_hour = datetime.now(timezone.utc).hour
     if not (TRADING_HOURS_START <= current_utc_hour < TRADING_HOURS_END):
-        print(f"--- Outside Trading Session (Current UTC Hour: {current_utc_hour}). Sleeping... ---")
         return
 
     print(f"--- Session OPEN. Starting Scan at {datetime.now()} ---")
@@ -180,8 +160,8 @@ def run_strategy():
         recent_low = float(df_15m['low'].iloc[-20:-2].min())
         recent_high = float(df_15m['high'].iloc[-20:-2].max())
 
-        swept_low = (sweep_candle['low'] < recent_low) and (sweep_candle['close'] > recent_low) and (sweep_candle['vol'] > sweep_candle['vol_ma'] * VOLUME_MULTIPLIER)
-        swept_high = (sweep_candle['high'] > recent_high) and (sweep_candle['close'] < recent_high) and (sweep_candle['vol'] > sweep_candle['vol_ma'] * VOLUME_MULTIPLIER)
+        swept_low = (sweep_candle['low'] < recent_low) and (sweep_candle['close'] > recent_low)
+        swept_high = (sweep_candle['high'] > recent_high) and (sweep_candle['close'] < recent_high)
 
         confirm_long = conf_candle['close'] > conf_candle['open']
         confirm_short = conf_candle['close'] < conf_candle['open']
@@ -200,36 +180,54 @@ def run_strategy():
             sl = current_price + (atr_value * ATR_MULTIPLIER)
             risk = sl - current_price
             tp = current_price - (risk * RISK_REWARD)
+
+        if signal:
+            print(f"🚨 SIGNAL: {signal} {symbol} | Entry: {current_price:.5f} | SL: {sl:.5f} | TP: {tp:.5f}")
+            
+            try:
+                order = client.orders.place(
+                    account_id, type="market", symbol=symbol, side="BUY" if signal == "LONG" else "SELL",
+                    volume=0.01, stop_loss=sl, take_profit=tp
+                )
+                
+                pip_size = get_pip_size(symbol)
+                sl_pips = abs(current_price - sl) / pip_size
+                tp_pips = abs(tp - current_price) / pip_size
+
+                journal.append({
+                    "symbol": symbol, "side": signal, "entry": current_price,
+                    "sl": sl, "tp": tp, "status": "OPEN", "time": datetime.now().isoformat()
+                })
+                
+                send_telegram(
+                    f"✅ {signal} {symbol} EXECUTED\n"
+                    f"Entry: {current_price:.5f}\n"
+                    f"SL (ATR): {sl:.5f} ({sl_pips:.1f} pips)\n"
+                    f"TP: {tp:.5f} ({tp_pips:.1f} pips)\n"
+                    f"Ticket: {order.ticket}"
+                )
+            except Exception as e:
+                print(f"Order Failed: {e}")
         else:
-            print(f"  [HOLD] {symbol}: No clean sweep + confirmation setup.")
-            continue
-
-        print(f"🚨 SIGNAL: {signal} {symbol} | Entry: {current_price:.5f} | SL: {sl:.5f} | TP: {tp:.5f}")
-        
-        try:
-            order = client.orders.place(
-                account_id, type="market", symbol=symbol, side="BUY" if signal == "LONG" else "SELL",
-                volume=0.01, stop_loss=sl, take_profit=tp
-            )
-            
-            pip_size = get_pip_size(symbol)
-            sl_pips = abs(current_price - sl) / pip_size
-            tp_pips = abs(tp - current_price) / pip_size
-
-            journal.append({
-                "symbol": symbol, "side": signal, "entry": current_price,
-                "sl": sl, "tp": tp, "status": "OPEN", "time": datetime.now().isoformat()
-            })
-            
-            send_telegram(
-                f"✅ {signal} {symbol} EXECUTED\n"
-                f"Entry: {current_price:.5f}\n"
-                f"SL (ATR): {sl:.5f} ({sl_pips:.1f} pips)\n"
-                f"TP: {tp:.5f} ({tp_pips:.1f} pips)\n"
-                f"Ticket: {order.ticket}"
-            )
-        except Exception as e:
-            print(f"Order Failed: {e}")
+            # 🚨 DEBUG TELEGRAM ALERT WITH 1-HOUR COOLDOWN
+            if time.time() - last_forex_telegram_time > 3600:
+                trend_str = 'BULLISH' if is_bullish else 'BEARISH' if is_bearish else 'FLAT'
+                
+                debug_msg = (
+                    f"🔍 *{symbol} ANALYSIS (HOLD)*\n\n"
+                    f"Price: {current_price:.4f}\n"
+                    f"4H Trend: {trend_str}\n"
+                    f"20-Bar Low: {recent_low:.4f}\n"
+                    f"20-Bar High: {recent_high:.4f}\n"
+                    f"Wick Swept Low? {swept_low}\n"
+                    f"Wick Swept High? {swept_high}\n"
+                    f"Result: No setup. Waiting."
+                )
+                send_telegram(debug_msg)
+                print(debug_msg)
+                last_forex_telegram_time = time.time()
+            else:
+                print(f"  [HOLD] {symbol}: No clean sweep + confirmation setup.")
 
     save_journal(journal)
 
