@@ -13,31 +13,13 @@ MT5_SERVER = os.getenv("MT5_SERVER")
 MT5_ACCOUNT = int(os.getenv("MT5_ACCOUNT"))
 MT5_PASSWORD = os.getenv("MT5_PASSWORD")
 
-# ✅ We will try XAUUSD first, then fallback to XAUUSDm if it fails
+# We try XAUUSD first, then fallback to XAUUSDm
 SYMBOLS_TO_TRY = ["XAUUSD", "XAUUSDm"]
 MONTHS_BACK = 12            
 
 ATR_MULTIPLIER = 2.0        
 TRAIL_ATR_MULTIPLIER = 3.0  
-SPREAD = 0.20               
-
-def fetch_mt5_candles(client, account_id, symbol, timeframe, total_needed):
-    """Fetches candles in chunks to bypass API limits."""
-    all_candles = []
-    chunk_size = 500
-    
-    print(f"Fetching {total_needed} candles for {symbol}...", flush=True)
-    
-    # We ask for the most recent candles. If the API doesn't support 'start_time', 
-    # we just ask for a large count and hope it doesn't choke.
-    try:
-        candles = client.candles.get(account_id, symbol=symbol, count=total_needed, timeframe=timeframe)
-        if candles:
-            return candles
-    except Exception as e:
-        print(f"Single request failed ({e}), trying chunked fallback...", flush=True)
-
-    return []
+SPREAD = 0.20               # Approximate spread for Gold
 
 def run_backtest():
     print("Connecting to MT5 to fetch 1 year of 4H Gold data...", flush=True)
@@ -74,11 +56,18 @@ def run_backtest():
         print("❌ No data returned from MT5 for any symbol. The broker API is blocking the request.", flush=True)
         return
 
+    # ✅ FIXED: The Tickerall library uses 'timestamp' instead of 'time'
     df = pd.DataFrame([{
-        'time': c.time, 'open': c.open, 'high': c.high, 'low': c.low, 'close': c.close, 'vol': getattr(c, 'volume', 1)
+        'time': c.timestamp, 
+        'open': c.open, 
+        'high': c.high, 
+        'low': c.low, 
+        'close': c.close, 
+        'vol': getattr(c, 'volume', getattr(c, 'tick_volume', 1))
     } for c in candles])
     
-    df['time'] = pd.to_datetime(df['time'])
+    # Convert timestamp to datetime
+    df['time'] = pd.to_datetime(df['time'], unit='ms')
     df = df.sort_values('time').reset_index(drop=True)
 
     # Calculate Indicators
@@ -106,6 +95,7 @@ def run_backtest():
     for i in range(200, len(df)):
         candle = df.iloc[i]
         
+        # Manage Trade
         if tr:
             if tr['side'] == 'LONG':
                 if candle['low'] <= tr['sl']:
@@ -122,6 +112,7 @@ def run_backtest():
                 else:
                     tr['sl'] = min(tr['sl'], candle['low'] + (TRAIL_ATR_MULTIPLIER * candle['atr']))
                     
+        # Check for Entry
         if not tr:
             s = df.iloc[i-1]
             is_trending = s['adx'] > 20
@@ -155,4 +146,3 @@ def run_backtest():
 if __name__ == "__main__":
     print("Starting FX 4H Trend Backtest...", flush=True)
     run_backtest()
-    
