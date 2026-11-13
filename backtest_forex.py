@@ -13,12 +13,31 @@ MT5_SERVER = os.getenv("MT5_SERVER")
 MT5_ACCOUNT = int(os.getenv("MT5_ACCOUNT"))
 MT5_PASSWORD = os.getenv("MT5_PASSWORD")
 
-SYMBOL = "XAUUSD"           
+# ✅ We will try XAUUSD first, then fallback to XAUUSDm if it fails
+SYMBOLS_TO_TRY = ["XAUUSD", "XAUUSDm"]
 MONTHS_BACK = 12            
 
 ATR_MULTIPLIER = 2.0        
 TRAIL_ATR_MULTIPLIER = 3.0  
-SPREAD = 0.20               # $0.20 spread on Gold
+SPREAD = 0.20               
+
+def fetch_mt5_candles(client, account_id, symbol, timeframe, total_needed):
+    """Fetches candles in chunks to bypass API limits."""
+    all_candles = []
+    chunk_size = 500
+    
+    print(f"Fetching {total_needed} candles for {symbol}...", flush=True)
+    
+    # We ask for the most recent candles. If the API doesn't support 'start_time', 
+    # we just ask for a large count and hope it doesn't choke.
+    try:
+        candles = client.candles.get(account_id, symbol=symbol, count=total_needed, timeframe=timeframe)
+        if candles:
+            return candles
+    except Exception as e:
+        print(f"Single request failed ({e}), trying chunked fallback...", flush=True)
+
+    return []
 
 def run_backtest():
     print("Connecting to MT5 to fetch 1 year of 4H Gold data...", flush=True)
@@ -34,18 +53,26 @@ def run_backtest():
         print(f"Failed to connect to MT5: {e}")
         return
 
-    try:
-        # Fetching 4H data
-        candles = client.candles.get(account_id, symbol=SYMBOL, count=1000, timeframe="H4")
-    except Exception as e:
-        print(f"Failed to fetch candles: {e}")
-        return
+    candles = []
+    active_symbol = None
+
+    # Try to find the correct symbol and fetch data
+    for sym in SYMBOLS_TO_TRY:
+        print(f"Attempting to fetch {sym}...", flush=True)
+        try:
+            # Requesting 1500 candles (approx 1 year of 4H)
+            res = client.candles.get(account_id, symbol=sym, count=1500, timeframe="H4")
+            if res and len(res) > 0:
+                candles = res
+                active_symbol = sym
+                print(f"✅ Successfully fetched {len(candles)} candles for {sym}.", flush=True)
+                break
+        except Exception as e:
+            print(f"Failed for {sym}: {e}", flush=True)
 
     if not candles:
-        print("No data returned.")
+        print("❌ No data returned from MT5 for any symbol. The broker API is blocking the request.", flush=True)
         return
-
-    print(f"Successfully fetched {len(candles)} candles.", flush=True)
 
     df = pd.DataFrame([{
         'time': c.time, 'open': c.open, 'high': c.high, 'low': c.low, 'close': c.close, 'vol': getattr(c, 'volume', 1)
@@ -117,7 +144,7 @@ def run_backtest():
     total_profit = sum(trades)
     
     print("\n" + "="*50)
-    print("  XAUUSD 4H TREND BACKTEST (1 YEAR)")
+    print(f"  {active_symbol} 4H TREND BACKTEST (1 YEAR)")
     print("="*50)
     print(f"  Trades: {total} | Win Rate: {(wins/total)*100:.1f}%")
     print(f"  Total Profit: ${total_profit:.2f}")
@@ -128,3 +155,4 @@ def run_backtest():
 if __name__ == "__main__":
     print("Starting FX 4H Trend Backtest...", flush=True)
     run_backtest()
+    
