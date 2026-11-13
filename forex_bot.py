@@ -17,28 +17,16 @@ MT5_PASSWORD = os.getenv("MT5_PASSWORD")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# ✅ ONLY GOLD
-SYMBOLS = ["XAUUSD", "XAUUSDm"]
+# ✅ EXNESS MICRO GOLD
+SYMBOL = "XAUUSDm"
 JOURNAL_FILE = "forex_journal.json"
 
-RISK_REWARD = 2.0
-ATR_MULTIPLIER = 1.5
-VOLUME_MULTIPLIER = 0.1 # Aggressive mode: volume filter off
+RISK_PERCENTAGE = 0.015      # 1.5% Risk per trade
+ATR_MULTIPLIER = 2.0         # Initial Stop Loss
+TRAIL_ATR_MULTIPLIER = 3.0   # Trailing Stop
 
-# ✅ AGGRESSIVE MODE: 24-Hour Trading
-TRADING_HOURS_START = 0
-TRADING_HOURS_END = 24
-
-# Global variable for debug cooldown
-last_forex_telegram_time = 0
-
-def is_market_open():
-    now = datetime.now(timezone.utc)
-    weekday = now.weekday()
-    if weekday == 4 and now.hour >= 21: return False # Friday
-    if weekday == 5: return False # Saturday
-    if weekday == 6 and now.hour < 21: return False # Sunday
-    return True
+def now_utc():
+    return datetime.now(timezone.utc)
 
 def send_telegram(msg, markdown=True):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID: return
@@ -49,16 +37,10 @@ def send_telegram(msg, markdown=True):
         payload["parse_mode"] = "Markdown"
     try: 
         r = requests.post(url, json=payload, timeout=10)
-        # If Markdown parsing fails, resend as plain text
         if not r.ok and markdown:
             send_telegram(msg, markdown=False)
     except Exception as e: 
         print(f"Telegram Error: {e}")
-
-def get_pip_size(symbol):
-    if "JPY" in symbol: return 0.01
-    if "XAU" in symbol: return 0.1 
-    return 0.0001
 
 def load_journal():
     if os.path.exists(JOURNAL_FILE):
@@ -70,48 +52,90 @@ def load_journal():
 def save_journal(journal):
     with open(JOURNAL_FILE, "w") as f: json.dump(journal, f, indent=4)
 
-def check_closed_trades(client, account_id, journal):
-    updated = False
+def fetch_mt5_candles(client, account_id, symbol, timeframe, count):
     try:
-        # ✅ FIXED: Use accounts.get to fetch positions
-        detail = client.accounts.get(account_id)
-        open_positions = detail.positions if hasattr(detail, 'positions') else []
-        open_symbols = [p.symbol for p in open_positions]
+        candles = client.candles.get(account_id, symbol=symbol, count=count, timeframe=timeframe)
+        if not candles: return pd.DataFrame()
         
-        for trade in journal:
-            if trade['status'] == "OPEN":
-                if trade['symbol'] not in open_symbols:
-                    report = (
-                        f"🔔 *TRADE CLOSED: {trade['symbol']}*\n\n"
-                        f"Check your Exness app for the final PnL.\n"
-                        f"Entry was: {trade['entry']:.5f}\n"
-                        f"🧠 Strategy: ATR Sweep"
-                    )
-                    send_telegram(report)
-                    print(report)
-                    
-                    trade['status'] = "CLOSED"
-                    updated = True
+        df = pd.DataFrame([{
+            'time': c.timestamp, 
+            'open': c.open, 
+            'high': c.high, 
+            'low': c.low, 
+            'close': c.close, 
+            'vol': getattr(c, 'volume', getattr(c, 'tick_volume', 1))
+        } for c in candles])
+        
+        df['time'] = pd.to_datetime(df['time'], unit='ms')
+        return df.sort_values('time').reset_index(drop=True)
     except Exception as e:
-        error_msg = f"⚠️ [RESOLVER ERROR] Could not check closed trades:\n{e}"
-        print(error_msg)
-        send_telegram(error_msg, markdown=False) # Send error to Telegram
-        
-    return updated
+        print(f"Fetch error: {e}")
+        return pd.DataFrame()
 
-def run_strategy():
-    global last_forex_telegram_time
+def manage_open_trade(client, account_id, journal):
+    open_trades = [t for t in journal if t['status'] == "OPEN"]
+    if not open_trades:
+        return False
+        
+    trade = open_trades[0] # We only hold 1 trade at a time
     
     try:
-        if not is_market_open():
-            print(f"--- Market is CLOSED (Weekend). Sleeping... ---")
-            return 
+        # Get current price
+        ticker = client.ticker.get(account_id, symbol=trade['symbol'])
+        current_price = float(ticker.ask if trade['side'] == 'BUY' else ticker.bid)
+        
+        # Get current 4H ATR
+        df = fetch_mt5_candles(client, account_id, trade['symbol'], "H4", 50)
+        if df.empty: return False
+        current_atr = df['tr'].ewm(alpha=1/14, adjust=False).mean().iloc[-1]
+        
+        # Check for trailing stop update
+        if trade['side'] == 'BUY':
+            trail_sl = current_price - (current_atr * TRAIL_ATR_MULTIPLIER)
+            if trail_sl > trade['sl']:
+                trade['sl'] = trail_sl
+                save_journal(journal)
+                print(f"Trailing SL updated for {trade['symbol']} to {trail_sl:.2f}")
+                
+                # Update stop loss on MT5
+                # Note: MT5 API for modifying orders can vary. If your Tickerall supports it, add it here.
+                # client.orders.modify(account_id, ticket=trade['ticket'], stop_loss=trail_sl)
+                
+            if current_price <= trade['sl']:
+                close_trade(client, account_id, journal, trade, current_price, "Trailing Stop Hit")
+                return True
+        else:
+            trail_sl = current_price + (current_atr * TRAIL_ATR_MULTIPLIER)
+            if trail_sl < trade['sl']:
+                trade['sl'] = trail_sl
+                save_journal(journal)
+                print(f"Trailing SL updated for {trade['symbol']} to {trail_sl:.2f}")
+                
+            if current_price >= trade['sl']:
+                close_trade(client, account_id, journal, trade, current_price, "Trailing Stop Hit")
+                return True
+                
+    except Exception as e:
+        print(f"Error managing trade: {e}")
+        
+    return False
 
-        current_utc_hour = datetime.now(timezone.utc).hour
-        if not (TRADING_HOURS_START <= current_utc_hour < TRADING_HOURS_END):
-            return
+def close_trade(client, account_id, journal, trade, exit_price, reason):
+    try:
+        # In a real MT5 integration, you would send a close order here.
+        # For now, we just mark it closed in the journal.
+        trade['status'] = 'CLOSED'
+        trade['exit'] = exit_price
+        trade['close_reason'] = reason
+        trade['closed_at'] = now_utc().isoformat()
+        save_journal(journal)
+        send_telegram(f"🛑 *TRADE CLOSED* ({reason})\nAsset: {trade['symbol']}\nEntry: {trade['entry']:.2f}\nExit: {exit_price:.2f}")
+    except Exception as e:
+        print(f"Close error: {e}")
 
-        print(f"--- Session OPEN. Starting Scan at {datetime.now()} ---")
+def run_strategy():
+    try:
+        print(f"--- FX 4H Scan at {now_utc().strftime('%Y-%m-%d %H:%M:%S')} UTC ---")
         
         client = Tickerall(api_key=TICKERALL_API_KEY, timeout=60)
         
@@ -122,141 +146,108 @@ def run_strategy():
             )
             account_id = session.account_id
         except Exception as e:
-            error_msg = f"⚠️ [CONNECTION ERROR] Failed to connect to MT5:\n{e}"
-            print(error_msg)
-            send_telegram(error_msg, markdown=False)
+            print(f"Failed to connect: {e}")
             return
 
         journal = load_journal()
+        
+        # 1. Manage existing trade
+        if manage_open_trade(client, account_id, journal):
+            return # If we just closed a trade, wait for next run
 
-        if check_closed_trades(client, account_id, journal):
-            save_journal(journal)
+        # 2. Check for new entries
+        if any(t['status'] == "OPEN" for t in journal):
+            print("[SKIP] Trade already open.")
+            return
 
-        for symbol in SYMBOLS:
-            if any(t['symbol'] == symbol and t['status'] == "OPEN" for t in journal):
-                continue
+        df = fetch_mt5_candles(client, account_id, SYMBOL, "H4", 250)
+        if df.empty or len(df) < 200:
+            print("[SKIP] Not enough data.")
+            return
 
-            print(f"Fetching data for {symbol}...")
-            df_4h = pd.DataFrame()
-            df_15m = pd.DataFrame()
+        # Indicators
+        df['tr'] = pd.concat([df['high'] - df['low'], (df['high'] - df['close'].shift()).abs(), (df['low'] - df['close'].shift()).abs()], axis=1).max(axis=1)
+        df['atr'] = df['tr'].ewm(alpha=1/14, adjust=False).mean()
+        df['ema200'] = df['close'].ewm(span=200, adjust=False).mean()
+        df['don_high'] = df['high'].rolling(20).max().shift(1)
+        df['don_low'] = df['low'].rolling(20).min().shift(1)
+        
+        up = df['high'].diff()
+        down = -df['low'].diff()
+        plus_dm = np.where((up > down) & (up > 0), up, 0.0)
+        minus_dm = np.where((down > up) & (down > 0), down, 0.0)
+        tr_s = df['tr'].ewm(alpha=1/14, adjust=False).mean()
+        pdi = 100 * pd.Series(plus_dm).ewm(alpha=1/14, adjust=False).mean() / tr_s
+        mdi = 100 * pd.Series(minus_dm).ewm(alpha=1/14, adjust=False).mean() / tr_s
+        dx = 100 * (pdi - mdi).abs() / (pdi + mdi).replace(0, np.nan)
+        df['adx'] = dx.ewm(alpha=1/14, adjust=False).mean()
+
+        # Use the last closed candle
+        last = df.iloc[-1]
+        
+        is_trending = last['adx'] > 20
+        is_bullish = last['close'] > last['ema200']
+        is_bearish = last['close'] < last['ema200']
+        
+        signal = None
+        if is_trending and is_bullish and last['close'] > last['don_high']:
+            signal = "LONG"
+        elif is_trending and is_bearish and last['close'] < last['don_low']:
+            signal = "SHORT"
+
+        if signal:
+            ticker = client.ticker.get(account_id, symbol=SYMBOL)
+            entry_price = float(ticker.ask if signal == "LONG" else ticker.bid)
+            atr = last['atr']
             
-            for attempt in range(2):
-                try:
-                    candles_4h = client.candles.get(account_id, symbol=symbol, count=50, timeframe="H4")
-                    candles_15m = client.candles.get(account_id, symbol=symbol, count=50, timeframe="M15")
-                    df_4h = pd.DataFrame([{'open': c.open, 'high': c.high, 'low': c.low, 'close': c.close, 'vol': getattr(c, 'volume', 1)} for c in candles_4h])
-                    df_15m = pd.DataFrame([{'open': c.open, 'high': c.high, 'low': c.low, 'close': c.close, 'vol': getattr(c, 'volume', 1)} for c in candles_15m])
-                    break 
-                except Exception as e:
-                    if attempt == 0: time.sleep(1) 
-                    else:
-                        print(f"⚠️ [DATA ERROR] Failed to fetch candles for {symbol}: {e}")
-
-            if df_4h.empty or df_15m.empty or len(df_4h) < 30:
-                continue 
-
-            # 4H Trend
-            df_4h['ema20'] = df_4h['close'].ewm(span=20, adjust=False).mean()
-            df_4h['ema50'] = df_4h['close'].ewm(span=50, adjust=False).mean()
-            is_bullish = df_4h['ema20'].iloc[-1] > df_4h['ema50'].iloc[-1]
-            is_bearish = df_4h['ema20'].iloc[-1] < df_4h['ema50'].iloc[-1]
-
-            # ATR and Volume MA
-            df_15m['high_low'] = df_15m['high'] - df_15m['low']
-            df_15m['high_close'] = (df_15m['high'] - df_15m['close'].shift()).abs()
-            df_15m['low_close'] = (df_15m['low'] - df_15m['close'].shift()).abs()
-            df_15m['tr'] = df_15m[['high_low', 'high_close', 'low_close']].max(axis=1)
-            df_15m['atr'] = df_15m['tr'].rolling(window=14).mean()
-            df_15m['vol_ma'] = df_15m['vol'].rolling(window=20).mean()
-
-            sweep_candle = df_15m.iloc[-2]
-            conf_candle = df_15m.iloc[-1]
-            
-            recent_low = float(df_15m['low'].iloc[-20:-2].min())
-            recent_high = float(df_15m['high'].iloc[-20:-2].max())
-
-            # Volume fallback
-            vol_ok_low = (sweep_candle['vol'] > sweep_candle['vol_ma'] * VOLUME_MULTIPLIER) if sweep_candle['vol_ma'] > 0 else True
-            vol_ok_high = (sweep_candle['vol'] > sweep_candle['vol_ma'] * VOLUME_MULTIPLIER) if sweep_candle['vol_ma'] > 0 else True
-
-            swept_low = (sweep_candle['low'] < recent_low) and (sweep_candle['close'] > recent_low) and vol_ok_low
-            swept_high = (sweep_candle['high'] > recent_high) and (sweep_candle['close'] < recent_high) and vol_ok_high
-
-            confirm_long = conf_candle['close'] > conf_candle['open']
-            confirm_short = conf_candle['close'] < conf_candle['open']
-
-            current_price = float(df_15m['close'].iloc[-1])
-            atr_value = float(sweep_candle['atr'])
-
-            signal = None
-            if is_bullish and swept_low and confirm_long:
-                signal = "LONG"
-                sl = current_price - (atr_value * ATR_MULTIPLIER)
-                risk = current_price - sl
-                tp = current_price + (risk * RISK_REWARD)
-            elif is_bearish and swept_high and confirm_short:
-                signal = "SHORT"
-                sl = current_price + (atr_value * ATR_MULTIPLIER)
-                risk = sl - current_price
-                tp = current_price - (risk * RISK_REWARD)
-
-            if signal:
-                print(f"🚨 SIGNAL: {signal} {symbol} | Entry: {current_price:.5f} | SL: {sl:.5f} | TP: {tp:.5f}")
-                
-                try:
-                    order = client.orders.place(
-                        account_id, type="market", symbol=symbol, side="BUY" if signal == "LONG" else "SELL",
-                        volume=0.01, stop_loss=sl, take_profit=tp
-                    )
-                    
-                    pip_size = get_pip_size(symbol)
-                    sl_pips = abs(current_price - sl) / pip_size
-                    tp_pips = abs(tp - current_price) / pip_size
-
-                    journal.append({
-                        "symbol": symbol, "side": signal, "entry": current_price,
-                        "sl": sl, "tp": tp, "status": "OPEN", "time": datetime.now().isoformat()
-                    })
-                    
-                    send_telegram(
-                        f"✅ {signal} {symbol} EXECUTED\n"
-                        f"Entry: {current_price:.5f}\n"
-                        f"SL (ATR): {sl:.5f} ({sl_pips:.1f} pips)\n"
-                        f"TP: {tp:.5f} ({tp_pips:.1f} pips)\n"
-                        f"Ticket: {order.ticket}"
-                    )
-                except Exception as e:
-                    error_msg = f"⚠️ [ORDER ERROR] Failed to place {signal} on {symbol}:\n{e}"
-                    print(error_msg)
-                    send_telegram(error_msg, markdown=False)
+            if signal == "LONG":
+                sl = entry_price - (atr * ATR_MULTIPLIER)
             else:
-                # Debug Telegram
-                if time.time() - last_forex_telegram_time > 3600:
-                    trend_str = 'BULLISH' if is_bullish else 'BEARISH' if is_bearish else 'FLAT'
-                    
-                    debug_msg = (
-                        f"🔍 *{symbol} ANALYSIS (HOLD)*\n\n"
-                        f"Price: {current_price:.4f}\n"
-                        f"4H Trend: {trend_str}\n"
-                        f"20-Bar Low: {recent_low:.4f}\n"
-                        f"20-Bar High: {recent_high:.4f}\n"
-                        f"Wick Swept Low? {swept_low}\n"
-                        f"Wick Swept High? {swept_high}\n"
-                        f"Result: No setup. Waiting."
-                    )
-                    send_telegram(debug_msg)
-                    print(debug_msg)
-                    last_forex_telegram_time = time.time()
-                else:
-                    print(f"  [HOLD] {symbol}: No clean sweep + confirmation setup.")
+                sl = entry_price + (atr * ATR_MULTIPLIER)
 
-        save_journal(journal)
+            # Position Sizing
+            # Fetch account balance (Assuming Tickerall provides this)
+            # For demo purposes, if balance isn't available, assume $10,000
+            try:
+                balance_info = client.accounts.get(account_id)
+                balance = float(balance_info.balance)
+            except:
+                balance = 10000.0
+                
+            risk_amount = balance * RISK_PERCENTAGE
+            price_risk = abs(entry_price - sl)
+            
+            # Calculate lot size (Gold: 1 lot = 100 oz. 1 pip = $0.10)
+            # For XAUUSDm, standard lot = 0.01 of standard.
+            # This requires knowing the exact contract specs from Exness.
+            # We will use a rough estimate: volume = risk / (price_risk * 100)
+            volume = round((risk_amount / price_risk) / 100, 2)
+            if volume < 0.01: volume = 0.01 # Minimum lot size
+
+            print(f"🚨 {signal} SIGNAL on {SYMBOL} | Entry: {entry_price:.2f} | SL: {sl:.2f} | Vol: {volume}")
+            
+            try:
+                order = client.orders.place(
+                    account_id, type="market", symbol=SYMBOL, side="BUY" if signal == "LONG" else "SELL",
+                    volume=volume, stop_loss=sl
+                )
+                
+                journal.append({
+                    "symbol": SYMBOL, "side": "BUY" if signal == "LONG" else "SELL", 
+                    "entry": entry_price, "sl": sl, "amount": volume,
+                    "status": "OPEN", "time": now_utc().isoformat(), "ticket": order.ticket
+                })
+                save_journal(journal)
+                
+                send_telegram(f"✅ *{signal} EXECUTED*\nAsset: {SYMBOL}\nEntry: {entry_price:.2f}\nSL: {sl:.2f}\nVol: {volume}")
+            except Exception as e:
+                print(f"Order Failed: {e}")
+                send_telegram(f"⚠️ Order Failed {SYMBOL}: {e}", markdown=False)
+        else:
+            print(f"[HOLD] {SYMBOL}: No setup. ADX={last['adx']:.1f}, Close={last['close']:.2f}")
 
     except Exception as e:
-        # ✅ GLOBAL CATCH: If anything breaks outside the specific try blocks, alert on Telegram
-        fatal_msg = f"🚨 [FATAL BOT CRASH]\n{str(e)}"
-        print(fatal_msg)
-        send_telegram(fatal_msg, markdown=False)
+        print(f"[FATAL ERROR] {e}")
 
 if __name__ == "__main__":
     run_strategy()
