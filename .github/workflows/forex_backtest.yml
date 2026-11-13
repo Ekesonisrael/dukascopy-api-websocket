@@ -1,11 +1,13 @@
-name: Pro Quant Backtest
+name: Backtest FX 4H Trend
 
 on:
   workflow_dispatch:
 
 jobs:
-  run-pro-backtest:
+  run-backtest:
     runs-on: ubuntu-latest
+    env:
+      PYTHONUNBUFFERED: 1
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v3
@@ -18,7 +20,12 @@ jobs:
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pandas numpy yfinance
+          pip install pandas numpy tickerall
 
-      - name: Run Pro Backtest
-        run: python pro_backtest.py
+      - name: Run Backtest
+        env:
+          TICKERALL_API_KEY: ${{ secrets.TICKERALL_API_KEY }}
+          MT5_SERVER: ${{ secrets.MT5_SERVER }}
+          MT5_ACCOUNT: ${{ secrets.MT5_ACCOUNT }}
+          MT5_PASSWORD: ${{ secrets.MT5_PASSWORD }}
+        run: python backtest_forex.py
