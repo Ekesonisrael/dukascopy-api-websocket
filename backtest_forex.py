@@ -1,167 +1,130 @@
+import os
 import pandas as pd
 import numpy as np
-import yfinance as yf
+import time
+from datetime import datetime, timezone
+from tickerall import Tickerall
 
 # ==========================================
 # CONFIGURATION
 # ==========================================
-SYMBOLS = {"GC=F": "Gold Futures"}
-RISK_REWARD = 2.0
-ATR_MULTIPLIER = 1.5
-VOLUME_MULTIPLIER = 1.5 # Keeping this, but we will bypass it if Yahoo sends 0s
-FEE_RATE = 0.0001 
+TICKERALL_API_KEY = os.getenv("TICKERALL_API_KEY")
+MT5_SERVER = os.getenv("MT5_SERVER")
+MT5_ACCOUNT = int(os.getenv("MT5_ACCOUNT"))
+MT5_PASSWORD = os.getenv("MT5_PASSWORD")
 
-TRADING_HOURS_START = 13
-TRADING_HOURS_END = 17
+SYMBOL = "XAUUSD"           
+MONTHS_BACK = 12            
 
-PERIOD = "30d"
-INTERVAL = "15m" 
+ATR_MULTIPLIER = 2.0        
+TRAIL_ATR_MULTIPLIER = 3.0  
+SPREAD = 0.20               # $0.20 spread on Gold
 
-def run_backtest(ticker, name):
-    print(f"\nFetching {PERIOD} of {INTERVAL} data for {name} ({ticker})...")
+def run_backtest():
+    print("Connecting to MT5 to fetch 1 year of 4H Gold data...", flush=True)
     
-    df = yf.download(ticker, period=PERIOD, interval=INTERVAL, progress=False)
-    
-    if df.empty:
-        print(f"❌ Failed to fetch data for {ticker}.")
+    client = Tickerall(api_key=TICKERALL_API_KEY, timeout=60)
+    try:
+        session = client.sessions.start(
+            broker="mt5", server=MT5_SERVER, account=MT5_ACCOUNT,
+            password=MT5_PASSWORD, terminal_type="MOBILE"
+        )
+        account_id = session.account_id
+    except Exception as e:
+        print(f"Failed to connect to MT5: {e}")
         return
 
-    if isinstance(df.columns, pd.MultiIndex): 
-        df.columns = df.columns.droplevel(1)
-    df.reset_index(inplace=True)
+    try:
+        # Fetching 4H data
+        candles = client.candles.get(account_id, symbol=SYMBOL, count=1000, timeframe="H4")
+    except Exception as e:
+        print(f"Failed to fetch candles: {e}")
+        return
+
+    if not candles:
+        print("No data returned.")
+        return
+
+    print(f"Successfully fetched {len(candles)} candles.", flush=True)
+
+    df = pd.DataFrame([{
+        'time': c.time, 'open': c.open, 'high': c.high, 'low': c.low, 'close': c.close, 'vol': getattr(c, 'volume', 1)
+    } for c in candles])
     
-    # ✅ FIX 1: Force everything to UTC
-    df['Datetime'] = pd.to_datetime(df['Datetime'], utc=True)
+    df['time'] = pd.to_datetime(df['time'])
+    df = df.sort_values('time').reset_index(drop=True)
+
+    # Calculate Indicators
+    df['tr'] = pd.concat([df['high'] - df['low'], (df['high'] - df['close'].shift()).abs(), (df['low'] - df['close'].shift()).abs()], axis=1).max(axis=1)
+    df['atr'] = df['tr'].ewm(alpha=1/14, adjust=False).mean()
+    df['ema200'] = df['close'].ewm(span=200, adjust=False).mean()
+    df['vol_ma'] = df['vol'].rolling(20).mean()
+    df['don_high'] = df['high'].rolling(20).max().shift(1)
+    df['don_low'] = df['low'].rolling(20).min().shift(1)
     
-    # ✅ FIX 2: Yahoo sometimes sends 0 volume for Gold. We replace 0 with 1 so the bot doesn't crash the filter.
-    df['Volume'] = df['Volume'].replace(0, 1)
-    df['Volume'] = df['Volume'].fillna(1)
-
-    df.set_index('Datetime', inplace=True)
-
-    # Resample to 4H
-    df_4h = df.resample('4h').agg({'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last'}).dropna()
-    df_4h['ema20'] = df_4h['Close'].ewm(span=20, adjust=False).mean()
-    df_4h['ema50'] = df_4h['Close'].ewm(span=50, adjust=False).mean()
-    df_4h['trend'] = np.where(df_4h['ema20'] > df_4h['ema50'], 1, -1)
-    
-    df.reset_index(inplace=True)
-
-    # ATR and Volume MA
-    df['high_low'] = df['High'] - df['Low']
-    df['high_close'] = (df['High'] - df['Close'].shift()).abs()
-    df['low_close'] = (df['Low'] - df['Close'].shift()).abs()
-    df['tr'] = df[['high_low', 'high_close', 'low_close']].max(axis=1)
-    df['atr'] = df['tr'].rolling(window=14).mean()
-    df['vol_ma'] = df['Volume'].rolling(window=20).mean()
-
-    df['recent_low'] = df['Low'].rolling(window=20).min().shift(1)
-    df['recent_high'] = df['High'].rolling(window=20).max().shift(1)
-
-    df['4h_time'] = df['Datetime'].dt.floor('4h')
-    df = pd.merge_asof(df, df_4h[['trend']], left_on='4h_time', right_index=True, direction='backward')
+    # ADX Calculation
+    up = df['high'].diff()
+    down = -df['low'].diff()
+    plus_dm = np.where((up > down) & (up > 0), up, 0.0)
+    minus_dm = np.where((down > up) & (down > 0), down, 0.0)
+    tr_s = df['tr'].ewm(alpha=1/14, adjust=False).mean()
+    pdi = 100 * pd.Series(plus_dm).ewm(alpha=1/14, adjust=False).mean() / tr_s
+    mdi = 100 * pd.Series(minus_dm).ewm(alpha=1/14, adjust=False).mean() / tr_s
+    dx = 100 * (pdi - mdi).abs() / (pdi + mdi).replace(0, np.nan)
+    df['adx'] = dx.ewm(alpha=1/14, adjust=False).mean()
 
     trades = []
-    i = 50 
+    tr = None
     
-    # ✅ Debug counters
-    sweeps_found = 0
-    sessions_passed = 0
-
-    while i < len(df) - 2:
-        sweep_row = df.iloc[i]
-        conf_row = df.iloc[i+1]
-        entry_row = df.iloc[i+2]
-
-        # Session Filter
-        current_hour = sweep_row['Datetime'].hour
-        if not (TRADING_HOURS_START <= current_hour < TRADING_HOURS_END):
-            i += 1
-            continue
+    for i in range(200, len(df)):
+        candle = df.iloc[i]
         
-        sessions_passed += 1
-
-        trade_entered = False
-        side = None
-
-        # To debug, let's remove the volume filter temporarily if Yahoo is giving us garbage data
-        vol_condition_low = (sweep_row['Volume'] >= sweep_row['vol_ma'] * VOLUME_MULTIPLIER) if sweep_row['vol_ma'] > 1 else True
-        vol_condition_high = (sweep_row['Volume'] >= sweep_row['vol_ma'] * VOLUME_MULTIPLIER) if sweep_row['vol_ma'] > 1 else True
-
-        swept_low = (sweep_row['Low'] < sweep_row['recent_low']) and (sweep_row['Close'] > sweep_row['recent_low']) and vol_condition_low
-        swept_high = (sweep_row['High'] > sweep_row['recent_high']) and (sweep_row['Close'] < sweep_row['recent_high']) and vol_condition_high
-
-        if swept_low or swept_high:
-            sweeps_found += 1
-
-        conf_long = conf_row['Close'] > conf_row['Open']
-        conf_short = conf_row['Close'] < conf_row['Open']
-
-        if sweep_row['trend'] == 1 and swept_low and conf_long:
-            entry = entry_row['Open']
-            sl = entry - (sweep_row['atr'] * ATR_MULTIPLIER)
-            risk = entry - sl
-            tp = entry + (risk * RISK_REWARD)
-            trade_entered = True
-            side = 'LONG'
-            
-        elif sweep_row['trend'] == -1 and swept_high and conf_short:
-            entry = entry_row['Open']
-            sl = entry + (sweep_row['atr'] * ATR_MULTIPLIER)
-            risk = sl - entry
-            tp = entry - (risk * RISK_REWARD)
-            trade_entered = True
-            side = 'SHORT'
-
-        if trade_entered:
-            exit_idx = None
-            result = None
-            cost_r = FEE_RATE / (risk / entry) 
-
-            for j in range(i+2, len(df)):
-                candle = df.iloc[j]
-                
-                if side == 'LONG':
-                    if candle['Low'] <= sl:
-                        result = 'LOSS'
-                        exit_idx = j; break
-                    elif candle['High'] >= tp:
-                        result = 'WIN'
-                        exit_idx = j; break
-                        
-                elif side == 'SHORT':
-                    if candle['High'] >= sl:
-                        result = 'LOSS'
-                        exit_idx = j; break
-                    elif candle['Low'] <= tp:
-                        result = 'WIN'
-                        exit_idx = j; break
-
-            if exit_idx:
-                net_r = (RISK_REWARD if result == 'WIN' else -1.0) - cost_r
-                trades.append({'result': result, 'r': net_r})
-                i = exit_idx + 1
+        if tr:
+            if tr['side'] == 'LONG':
+                if candle['low'] <= tr['sl']:
+                    pnl = (tr['sl'] - tr['entry'] - SPREAD)
+                    trades.append(pnl)
+                    tr = None
+                else:
+                    tr['sl'] = max(tr['sl'], candle['high'] - (TRAIL_ATR_MULTIPLIER * candle['atr']))
             else:
-                i += 1
-        else:
-            i += 1
-
-    print(f"--- DEBUG INFO ---")
-    print(f"Candles in Session: {sessions_passed}")
-    print(f"Raw Sweeps Found: {sweeps_found}")
-
-    if not trades:
-        print("❌ No trades executed. Sweeps happened, but trend/confirmation failed.")
-        return
+                if candle['high'] >= tr['sl']:
+                    pnl = (tr['entry'] - tr['sl'] - SPREAD)
+                    trades.append(pnl)
+                    tr = None
+                else:
+                    tr['sl'] = min(tr['sl'], candle['low'] + (TRAIL_ATR_MULTIPLIER * candle['atr']))
+                    
+        if not tr:
+            s = df.iloc[i-1]
+            is_trending = s['adx'] > 20
+            
+            if is_trending and s['close'] > s['ema200'] and s['close'] > s['don_high']:
+                entry = candle['open']
+                sl = entry - (ATR_MULTIPLIER * s['atr'])
+                tr = {'side': 'LONG', 'entry': entry, 'sl': sl}
+            elif is_trending and s['close'] < s['ema200'] and s['close'] < s['don_low']:
+                entry = candle['open']
+                sl = entry + (ATR_MULTIPLIER * s['atr'])
+                tr = {'side': 'SHORT', 'entry': entry, 'sl': sl}
 
     total = len(trades)
-    wins = sum(1 for t in trades if t['result'] == 'WIN')
-    total_r = sum(t['r'] for t in trades)
-
-    print(f"\n=== {name} 30-DAY BACKTEST (15m) ===")
-    print(f"Total Trades: {total} | Wins: {wins} | Win Rate: {(wins/total)*100:.2f}%")
-    print(f"Total R: {total_r:+.2f}R | Avg R: {(total_r/total):+.2f}R")
+    if total == 0:
+        print("No trades found.")
+        return
+        
+    wins = sum(1 for r in trades if r > 0)
+    total_profit = sum(trades)
+    
+    print("\n" + "="*50)
+    print("  XAUUSD 4H TREND BACKTEST (1 YEAR)")
+    print("="*50)
+    print(f"  Trades: {total} | Win Rate: {(wins/total)*100:.1f}%")
+    print(f"  Total Profit: ${total_profit:.2f}")
+    print(f"  Avg Win: ${np.mean([t for t in trades if t > 0]):.2f}" if wins > 0 else "  Avg Win: $0.00")
+    print(f"  Avg Loss: ${np.mean([t for t in trades if t <= 0]):.2f}" if (total-wins) > 0 else "  Avg Loss: $0.00")
+    print("="*50)
 
 if __name__ == "__main__":
-    for ticker, name in SYMBOLS.items():
-        run_backtest(ticker, name)
+    print("Starting FX 4H Trend Backtest...", flush=True)
+    run_backtest()
