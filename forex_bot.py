@@ -20,6 +20,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 # ✅ EXNESS MICRO GOLD
 SYMBOL = "XAUUSDm"
 JOURNAL_FILE = "forex_journal.json"
+STATE_FILE = "forex_state.json"
 
 RISK_PERCENTAGE = 0.015      # 1.5% Risk per trade
 ATR_MULTIPLIER = 2.0         # Initial Stop Loss
@@ -27,6 +28,16 @@ TRAIL_ATR_MULTIPLIER = 3.0   # Trailing Stop
 
 def now_utc():
     return datetime.now(timezone.utc)
+
+def load_json(path, default):
+    if os.path.exists(path):
+        try:
+            with open(path, "r") as f: return json.load(f)
+        except: pass
+    return default
+
+def save_json(path, data):
+    with open(path, "w") as f: json.dump(data, f, indent=4)
 
 def send_telegram(msg, markdown=True):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID: return
@@ -41,16 +52,6 @@ def send_telegram(msg, markdown=True):
             send_telegram(msg, markdown=False)
     except Exception as e: 
         print(f"Telegram Error: {e}")
-
-def load_journal():
-    if os.path.exists(JOURNAL_FILE):
-        try:
-            with open(JOURNAL_FILE, "r") as f: return json.load(f)
-        except: return []
-    return []
-
-def save_journal(journal):
-    with open(JOURNAL_FILE, "w") as f: json.dump(journal, f, indent=4)
 
 def fetch_mt5_candles(client, account_id, symbol, timeframe, count):
     try:
@@ -77,29 +78,22 @@ def manage_open_trade(client, account_id, journal):
     if not open_trades:
         return False
         
-    trade = open_trades[0] # We only hold 1 trade at a time
+    trade = open_trades[0]
     
     try:
-        # Get current price
         ticker = client.ticker.get(account_id, symbol=trade['symbol'])
         current_price = float(ticker.ask if trade['side'] == 'BUY' else ticker.bid)
         
-        # Get current 4H ATR
         df = fetch_mt5_candles(client, account_id, trade['symbol'], "H4", 50)
         if df.empty: return False
         current_atr = df['tr'].ewm(alpha=1/14, adjust=False).mean().iloc[-1]
         
-        # Check for trailing stop update
         if trade['side'] == 'BUY':
             trail_sl = current_price - (current_atr * TRAIL_ATR_MULTIPLIER)
             if trail_sl > trade['sl']:
                 trade['sl'] = trail_sl
-                save_journal(journal)
+                save_json(JOURNAL_FILE, journal)
                 print(f"Trailing SL updated for {trade['symbol']} to {trail_sl:.2f}")
-                
-                # Update stop loss on MT5
-                # Note: MT5 API for modifying orders can vary. If your Tickerall supports it, add it here.
-                # client.orders.modify(account_id, ticket=trade['ticket'], stop_loss=trail_sl)
                 
             if current_price <= trade['sl']:
                 close_trade(client, account_id, journal, trade, current_price, "Trailing Stop Hit")
@@ -108,7 +102,7 @@ def manage_open_trade(client, account_id, journal):
             trail_sl = current_price + (current_atr * TRAIL_ATR_MULTIPLIER)
             if trail_sl < trade['sl']:
                 trade['sl'] = trail_sl
-                save_journal(journal)
+                save_json(JOURNAL_FILE, journal)
                 print(f"Trailing SL updated for {trade['symbol']} to {trail_sl:.2f}")
                 
             if current_price >= trade['sl']:
@@ -122,13 +116,14 @@ def manage_open_trade(client, account_id, journal):
 
 def close_trade(client, account_id, journal, trade, exit_price, reason):
     try:
-        # In a real MT5 integration, you would send a close order here.
-        # For now, we just mark it closed in the journal.
+        # Close on MT5
+        # client.orders.close(account_id, ticket=trade['ticket']) 
+        
         trade['status'] = 'CLOSED'
         trade['exit'] = exit_price
         trade['close_reason'] = reason
         trade['closed_at'] = now_utc().isoformat()
-        save_journal(journal)
+        save_json(JOURNAL_FILE, journal)
         send_telegram(f"🛑 *TRADE CLOSED* ({reason})\nAsset: {trade['symbol']}\nEntry: {trade['entry']:.2f}\nExit: {exit_price:.2f}")
     except Exception as e:
         print(f"Close error: {e}")
@@ -149,11 +144,12 @@ def run_strategy():
             print(f"Failed to connect: {e}")
             return
 
-        journal = load_journal()
+        journal = load_json(JOURNAL_FILE, [])
+        state = load_json(STATE_FILE, {})
         
         # 1. Manage existing trade
         if manage_open_trade(client, account_id, journal):
-            return # If we just closed a trade, wait for next run
+            return 
 
         # 2. Check for new entries
         if any(t['status'] == "OPEN" for t in journal):
@@ -165,7 +161,6 @@ def run_strategy():
             print("[SKIP] Not enough data.")
             return
 
-        # Indicators
         df['tr'] = pd.concat([df['high'] - df['low'], (df['high'] - df['close'].shift()).abs(), (df['low'] - df['close'].shift()).abs()], axis=1).max(axis=1)
         df['atr'] = df['tr'].ewm(alpha=1/14, adjust=False).mean()
         df['ema200'] = df['close'].ewm(span=200, adjust=False).mean()
@@ -182,7 +177,6 @@ def run_strategy():
         dx = 100 * (pdi - mdi).abs() / (pdi + mdi).replace(0, np.nan)
         df['adx'] = dx.ewm(alpha=1/14, adjust=False).mean()
 
-        # Use the last closed candle
         last = df.iloc[-1]
         
         is_trending = last['adx'] > 20
@@ -205,9 +199,6 @@ def run_strategy():
             else:
                 sl = entry_price + (atr * ATR_MULTIPLIER)
 
-            # Position Sizing
-            # Fetch account balance (Assuming Tickerall provides this)
-            # For demo purposes, if balance isn't available, assume $10,000
             try:
                 balance_info = client.accounts.get(account_id)
                 balance = float(balance_info.balance)
@@ -216,13 +207,8 @@ def run_strategy():
                 
             risk_amount = balance * RISK_PERCENTAGE
             price_risk = abs(entry_price - sl)
-            
-            # Calculate lot size (Gold: 1 lot = 100 oz. 1 pip = $0.10)
-            # For XAUUSDm, standard lot = 0.01 of standard.
-            # This requires knowing the exact contract specs from Exness.
-            # We will use a rough estimate: volume = risk / (price_risk * 100)
             volume = round((risk_amount / price_risk) / 100, 2)
-            if volume < 0.01: volume = 0.01 # Minimum lot size
+            if volume < 0.01: volume = 0.01
 
             print(f"🚨 {signal} SIGNAL on {SYMBOL} | Entry: {entry_price:.2f} | SL: {sl:.2f} | Vol: {volume}")
             
@@ -237,17 +223,35 @@ def run_strategy():
                     "entry": entry_price, "sl": sl, "amount": volume,
                     "status": "OPEN", "time": now_utc().isoformat(), "ticket": order.ticket
                 })
-                save_journal(journal)
+                save_json(JOURNAL_FILE, journal)
                 
                 send_telegram(f"✅ *{signal} EXECUTED*\nAsset: {SYMBOL}\nEntry: {entry_price:.2f}\nSL: {sl:.2f}\nVol: {volume}")
             except Exception as e:
                 print(f"Order Failed: {e}")
                 send_telegram(f"⚠️ Order Failed {SYMBOL}: {e}", markdown=False)
         else:
-            print(f"[HOLD] {SYMBOL}: No setup. ADX={last['adx']:.1f}, Close={last['close']:.2f}")
+            # ✅ DEBUG TELEGRAM WITH PERSISTENT 1-HOUR COOLDOWN
+            last_telegram_time = state.get('last_telegram_time', 0)
+            if time.time() - last_telegram_time > 3600:
+                trend_str = "BULLISH" if is_bullish else "BEARISH" if is_bearish else "FLAT"
+                debug_msg = (
+                    f"🔍 *{SYMBOL} 4H ANALYSIS (HOLD)*\n\n"
+                    f"Price: {last['close']:.2f}\n"
+                    f"4H Trend: {trend_str}\n"
+                    f"ADX: {last['adx']:.1f} (Needs > 20)\n"
+                    f"Broken High? {last['close'] > last['don_high']}\n"
+                    f"Broken Low? {last['close'] < last['don_low']}\n"
+                    f"Result: Waiting for breakout."
+                )
+                send_telegram(debug_msg)
+                print(debug_msg)
+                
+                state['last_telegram_time'] = time.time()
+                save_json(STATE_FILE, state)
 
     except Exception as e:
         print(f"[FATAL ERROR] {e}")
 
 if __name__ == "__main__":
     run_strategy()
+
